@@ -1,0 +1,54 @@
+services:
+  transcribe-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: transcribe-api:latest
+    container_name: transcribe-api
+    restart: unless-stopped
+
+    # 載入環境變數（敏感資訊放 .env，不入 git）
+    env_file:
+      - .env
+
+    ports:
+      - "${PORT:-8787}:8000"
+
+    volumes:
+      # 上傳暫存：轉錄完成後自動刪除
+      - uploads:/app/uploads
+      # 輸出結果：逐字稿 Markdown + 工作狀態 JSON
+      - outputs:/app/outputs
+      # HuggingFace 模型快取（WhisperX / Pyannote）
+      - hf_cache:/root/.cache/huggingface
+      # ModelScope 模型快取（FunASR CT-Punc，~1 GB）
+      - modelscope_cache:/root/.cache/modelscope
+
+    # NVIDIA GPU 支援（需安裝 nvidia-container-toolkit）
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+    # 健康檢查：每 30 秒確認服務可用
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s   # 等待模型初始化
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+volumes:
+  uploads:
+  outputs:
+  hf_cache:
+  modelscope_cache:

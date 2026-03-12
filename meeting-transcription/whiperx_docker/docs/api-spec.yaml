@@ -1,0 +1,671 @@
+openapi: 3.0.3
+
+info:
+  title: WhisperX 語音轉錄 API
+  version: 1.0.0
+  description: |
+    ## 概述
+
+    將音訊上傳後，由後端以 WhisperX 進行：
+    1. **語音辨識**（Whisper large-v3）
+    2. **詞對齊**（force alignment）
+    3. **語者分離**（Pyannote speaker diarization）
+    4. **標點補強**（Groq API，可選）
+
+    最終輸出帶有時間戳記與語者標籤的 **Markdown 逐字稿**。
+
+    ## 認證
+
+    請在所有請求的 Header 中帶入：
+    ```
+    X-API-Key: <your-api-key>
+    ```
+    若服務端未設定 `API_KEY` 環境變數，則不需認證。
+
+    ## 非同步流程
+
+    ```
+    POST /transcribe → 取得 job_id（HTTP 202）
+           ↓
+    GET /jobs/{job_id}  （每 15 秒輪詢一次）
+           ↓  status == "done"
+    GET /jobs/{job_id}/result  → 下載 Markdown 逐字稿
+    ```
+
+servers:
+  - url: http://localhost:8000
+    description: 本機開發環境
+  - url: http://{host}:{port}
+    description: 自訂伺服器
+    variables:
+      host:
+        default: your-server-ip
+      port:
+        default: "8000"
+
+security:
+  - ApiKeyAuth: []
+
+tags:
+  - name: 轉錄
+    description: 提交音訊並啟動轉錄任務
+  - name: 工作管理
+    description: 查詢、列出、刪除工作
+  - name: 系統
+    description: 健康檢查與服務狀態
+
+# ===========================================================================
+# Paths
+# ===========================================================================
+
+paths:
+
+  # -------------------------------------------------------------------------
+  # POST /transcribe
+  # -------------------------------------------------------------------------
+  /transcribe:
+    post:
+      tags: [轉錄]
+      summary: 上傳音訊，啟動轉錄任務
+      description: |
+        上傳音訊檔案後，服務**立即回傳** `job_id`（HTTP 202），
+        轉錄在背景非同步執行。
+
+        **支援格式**：mp3、mp4、wav、m4a、ogg、flac、webm、aac
+
+        **注意**：由於 GPU 記憶體限制，同一時間只處理一個任務，
+        多個請求會依序排隊執行。
+      operationId: transcribe
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - audio
+              properties:
+                audio:
+                  type: string
+                  format: binary
+                  description: 音訊檔（mp3 / wav / m4a / mp4 / ogg / flac / webm / aac）
+                lang:
+                  type: string
+                  default: zh
+                  description: |
+                    語言代碼。常用值：
+                    - `zh`：繁體中文 / 簡體中文
+                    - `en`：英文
+                    - `ja`：日文
+                    - `auto`：自動偵測
+                  example: zh
+                device:
+                  type: string
+                  default: auto
+                  enum: [auto, cpu, cuda, mps]
+                  description: |
+                    運算裝置：
+                    - `auto`：自動選擇（cuda > mps > cpu）
+                    - `cuda`：NVIDIA GPU
+                    - `mps`：Apple Silicon GPU
+                    - `cpu`：僅使用 CPU（較慢，使用 medium 模型）
+                num_speakers:
+                  type: integer
+                  minimum: 1
+                  maximum: 10
+                  nullable: true
+                  description: |
+                    預先指定語者人數（1–10）。
+                    不填則由 Pyannote 自動偵測，
+                    建議在已知人數時填入以提升準確率。
+                  example: 3
+                no_punctuation:
+                  type: boolean
+                  default: false
+                  description: |
+                    設為 `true` 可跳過 Groq 標點補強（加快速度，但輸出無標點）。
+                    若服務端未設定 `GROQ_API_KEY`，此參數無效（自動跳過補強）。
+            encoding:
+              audio:
+                contentType: audio/mpeg, audio/wav, audio/mp4, audio/ogg, audio/flac, audio/webm
+      responses:
+        "202":
+          description: 任務已建立，正在排隊
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TranscribeResponse"
+              example:
+                job_id: "550e8400-e29b-41d4-a716-446655440000"
+                status: pending
+                message: "任務已建立，請使用 GET /jobs/{job_id} 查詢進度。"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "413":
+          $ref: "#/components/responses/FileTooLarge"
+
+  # -------------------------------------------------------------------------
+  # GET /jobs/{job_id}
+  # -------------------------------------------------------------------------
+  /jobs/{job_id}:
+    get:
+      tags: [工作管理]
+      summary: 查詢工作狀態
+      description: |
+        回傳工作的完整狀態記錄。建議每 **15 秒**輪詢一次。
+
+        **狀態說明**：
+        | 狀態 | 說明 |
+        |------|------|
+        | `pending` | 排隊等待中 |
+        | `running` | 轉錄進行中（通常為音訊時長的 0.3–0.5 倍時間）|
+        | `done` | 完成，可呼叫 `/jobs/{job_id}/result` 下載 |
+        | `failed` | 失敗，錯誤訊息在 `error` 欄位 |
+      operationId: getJob
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      responses:
+        "200":
+          description: 工作狀態
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobRecord"
+              examples:
+                running:
+                  summary: 轉錄進行中
+                  value:
+                    job_id: "550e8400-e29b-41d4-a716-446655440000"
+                    status: running
+                    created_at: "2026-03-11T10:00:00Z"
+                    updated_at: "2026-03-11T10:00:05Z"
+                    audio_filename: "meeting-2026-03-11.mp3"
+                    language: zh
+                    device: cuda
+                    num_speakers: 3
+                    add_punctuation: true
+                    duration_seconds: null
+                    num_speakers_detected: null
+                    output_path: null
+                    error: null
+                done:
+                  summary: 轉錄完成
+                  value:
+                    job_id: "550e8400-e29b-41d4-a716-446655440000"
+                    status: done
+                    created_at: "2026-03-11T10:00:00Z"
+                    updated_at: "2026-03-11T10:08:30Z"
+                    audio_filename: "meeting-2026-03-11.mp3"
+                    language: zh
+                    device: cuda
+                    num_speakers: 3
+                    add_punctuation: true
+                    duration_seconds: 3600.0
+                    num_speakers_detected: 3
+                    output_path: "/app/outputs/550e8400.../meeting-2026-03-11_逐字稿.md"
+                    error: null
+                failed:
+                  summary: 轉錄失敗
+                  value:
+                    job_id: "550e8400-e29b-41d4-a716-446655440000"
+                    status: failed
+                    created_at: "2026-03-11T10:00:00Z"
+                    updated_at: "2026-03-11T10:00:10Z"
+                    audio_filename: "meeting-2026-03-11.mp3"
+                    language: zh
+                    device: cuda
+                    num_speakers: null
+                    add_punctuation: true
+                    duration_seconds: null
+                    num_speakers_detected: null
+                    output_path: null
+                    error: "HF_TOKEN 未設定，無法執行語者分離"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+    delete:
+      tags: [工作管理]
+      summary: 刪除工作
+      description: |
+        刪除工作記錄及對應的逐字稿輸出目錄，釋放磁碟空間。
+
+        **注意**：刪除後無法復原，包含已完成的逐字稿也會一併刪除。
+      operationId: deleteJob
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      responses:
+        "200":
+          description: 刪除成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeleteResponse"
+              example:
+                message: "工作 550e8400-e29b-41d4-a716-446655440000 已刪除。"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # -------------------------------------------------------------------------
+  # GET /jobs/{job_id}/result
+  # -------------------------------------------------------------------------
+  /jobs/{job_id}/result:
+    get:
+      tags: [工作管理]
+      summary: 下載逐字稿 Markdown
+      description: |
+        工作狀態為 `done` 時，下載帶有時間戳記與語者標籤的 Markdown 逐字稿。
+
+        **回應格式**：`text/markdown; charset=utf-8`（直接下載文字檔）
+
+        **逐字稿格式範例**：
+        ```markdown
+        # 逐字稿 - meeting-2026-03-11
+
+        **語言:** zh
+        **總時長:** 01:00:00
+        **語者人數:** 3
+
+        ---
+
+        **[00:00:05 → 00:00:32] Speaker 1:**
+        大家好，今天我們來討論第一季的業績報告。
+
+        **[00:00:33 → 00:01:10] Speaker 2:**
+        好的，根據數據顯示，本季營收成長了 15%。
+
+        **[00:01:11 → 00:01:45] Speaker 3:**
+        我有一個問題，關於成本結構的部分...
+        ```
+      operationId: getResult
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      responses:
+        "200":
+          description: Markdown 逐字稿文字檔
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+              example: 'attachment; filename="meeting-2026-03-11_逐字稿.md"'
+          content:
+            text/markdown:
+              schema:
+                type: string
+              example: |
+                # 逐字稿 - meeting-2026-03-11
+
+                **語言:** zh
+                **總時長:** 01:00:00
+                **語者人數:** 3
+
+                ---
+
+                **[00:00:05 → 00:00:32] Speaker 1:**
+                大家好，今天我們來討論第一季的業績報告。
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: 工作尚未完成
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                detail: "工作尚未完成（目前狀態：running）。"
+        "410":
+          description: 逐字稿檔案已被刪除（超過 TTL 後清理）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                detail: "逐字稿檔案已被刪除。"
+
+  # -------------------------------------------------------------------------
+  # GET /jobs
+  # -------------------------------------------------------------------------
+  /jobs:
+    get:
+      tags: [工作管理]
+      summary: 列出所有工作
+      description: |
+        列出所有工作，依建立時間**倒序**排列（最新在前）。
+
+        可用 `status` query parameter 篩選特定狀態的工作。
+      operationId: listJobs
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [pending, running, done, failed]
+          description: 篩選特定狀態的工作（不填則回傳全部）
+          example: done
+      responses:
+        "200":
+          description: 工作清單
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobListResponse"
+              example:
+                total: 2
+                jobs:
+                  - job_id: "550e8400-e29b-41d4-a716-446655440000"
+                    status: done
+                    created_at: "2026-03-11T10:00:00Z"
+                    updated_at: "2026-03-11T10:08:30Z"
+                    audio_filename: "meeting-A.mp3"
+                    language: zh
+                    device: cuda
+                    num_speakers: null
+                    add_punctuation: true
+                    duration_seconds: 3600.0
+                    num_speakers_detected: 3
+                    output_path: "/app/outputs/550e8400.../meeting-A_逐字稿.md"
+                    error: null
+                  - job_id: "660f9500-f30c-52e5-b827-557766551111"
+                    status: running
+                    created_at: "2026-03-11T11:00:00Z"
+                    updated_at: "2026-03-11T11:00:08Z"
+                    audio_filename: "meeting-B.mp3"
+                    language: zh
+                    device: cuda
+                    num_speakers: 2
+                    add_punctuation: true
+                    duration_seconds: null
+                    num_speakers_detected: null
+                    output_path: null
+                    error: null
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # -------------------------------------------------------------------------
+  # GET /health
+  # -------------------------------------------------------------------------
+  /health:
+    get:
+      tags: [系統]
+      summary: 服務健康檢查
+      description: |
+        回傳服務狀態、GPU 資訊及必要環境變數的設定情況。
+
+        **此端點不需 API Key 認證**，可用於 Load Balancer 健康檢查。
+      operationId: health
+      security: []
+      responses:
+        "200":
+          description: 服務正常
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              examples:
+                gpu_ready:
+                  summary: GPU 就緒
+                  value:
+                    status: ok
+                    gpu: true
+                    gpu_name: "NVIDIA GeForce RTX 3090"
+                    gpu_memory_gb: 24.0
+                    hf_token_set: true
+                    groq_key_set: true
+                cpu_only:
+                  summary: 僅 CPU
+                  value:
+                    status: ok
+                    gpu: false
+                    gpu_name: null
+                    gpu_memory_gb: null
+                    hf_token_set: true
+                    groq_key_set: false
+
+# ===========================================================================
+# Components
+# ===========================================================================
+
+components:
+
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: |
+        服務端設定 `API_KEY` 環境變數後啟用。
+        未設定時所有請求不需認證。
+
+  parameters:
+    JobId:
+      name: job_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: 工作唯一識別碼（UUID v4）
+      example: "550e8400-e29b-41d4-a716-446655440000"
+
+  responses:
+    BadRequest:
+      description: 請求格式錯誤（檔案格式不支援或檔案為空）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            detail: "不支援的檔案格式：.txt。支援：.aac, .flac, .m4a, .mp3, .mp4, .ogg, .wav, .webm"
+    Unauthorized:
+      description: API Key 錯誤或未提供
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            detail: "Invalid or missing X-API-Key header."
+    NotFound:
+      description: 找不到指定的工作
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            detail: "找不到工作 550e8400-e29b-41d4-a716-446655440000"
+    FileTooLarge:
+      description: 上傳檔案超過大小限制
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            detail: "檔案超過上限 500 MB。"
+
+  schemas:
+
+    JobStatus:
+      type: string
+      enum: [pending, running, done, failed]
+      description: |
+        工作狀態：
+        - `pending`：排隊等待中
+        - `running`：轉錄進行中
+        - `done`：完成，可下載逐字稿
+        - `failed`：失敗，查看 `error` 欄位
+
+    JobRecord:
+      type: object
+      description: 轉錄工作的完整狀態記錄
+      required:
+        - job_id
+        - status
+        - created_at
+        - updated_at
+        - audio_filename
+        - language
+        - device
+        - add_punctuation
+      properties:
+        job_id:
+          type: string
+          format: uuid
+          description: 工作唯一識別碼
+          example: "550e8400-e29b-41d4-a716-446655440000"
+        status:
+          $ref: "#/components/schemas/JobStatus"
+        created_at:
+          type: string
+          format: date-time
+          description: 工作建立時間（ISO 8601 UTC）
+          example: "2026-03-11T10:00:00Z"
+        updated_at:
+          type: string
+          format: date-time
+          description: 最後更新時間（ISO 8601 UTC）
+          example: "2026-03-11T10:08:30Z"
+        audio_filename:
+          type: string
+          description: 原始音訊檔名
+          example: "meeting-2026-03-11.mp3"
+        language:
+          type: string
+          description: 指定的語言代碼
+          example: "zh"
+        device:
+          type: string
+          description: 使用的運算裝置
+          example: "cuda"
+        num_speakers:
+          type: integer
+          nullable: true
+          description: 指定的語者人數（null 表示自動偵測）
+          example: 3
+        add_punctuation:
+          type: boolean
+          description: 是否啟用標點補強
+          example: true
+        duration_seconds:
+          type: number
+          format: float
+          nullable: true
+          description: 音訊總時長（秒），完成後才有值
+          example: 3600.0
+        num_speakers_detected:
+          type: integer
+          nullable: true
+          description: 實際偵測到的語者人數，完成後才有值
+          example: 3
+        output_path:
+          type: string
+          nullable: true
+          description: 容器內逐字稿檔案路徑（僅供參考）
+          example: "/app/outputs/550e8400.../meeting-2026-03-11_逐字稿.md"
+        error:
+          type: string
+          nullable: true
+          description: 失敗時的錯誤訊息
+          example: null
+
+    TranscribeResponse:
+      type: object
+      description: POST /transcribe 成功後的回應
+      required:
+        - job_id
+        - status
+        - message
+      properties:
+        job_id:
+          type: string
+          format: uuid
+          description: 工作唯一識別碼，後續用此 ID 查詢狀態
+          example: "550e8400-e29b-41d4-a716-446655440000"
+        status:
+          $ref: "#/components/schemas/JobStatus"
+        message:
+          type: string
+          description: 說明訊息
+          example: "任務已建立，請使用 GET /jobs/{job_id} 查詢進度。"
+
+    JobListResponse:
+      type: object
+      description: GET /jobs 的回應
+      required:
+        - total
+        - jobs
+      properties:
+        total:
+          type: integer
+          description: 工作總數（篩選後）
+          example: 5
+        jobs:
+          type: array
+          description: 工作清單（依建立時間倒序）
+          items:
+            $ref: "#/components/schemas/JobRecord"
+
+    DeleteResponse:
+      type: object
+      description: DELETE /jobs/{job_id} 的回應
+      required:
+        - message
+      properties:
+        message:
+          type: string
+          description: 刪除結果說明
+          example: "工作 550e8400-e29b-41d4-a716-446655440000 已刪除。"
+
+    HealthResponse:
+      type: object
+      description: GET /health 的回應
+      required:
+        - status
+        - gpu
+        - hf_token_set
+        - groq_key_set
+      properties:
+        status:
+          type: string
+          description: 服務狀態
+          example: "ok"
+        gpu:
+          type: boolean
+          description: 是否偵測到 GPU
+          example: true
+        gpu_name:
+          type: string
+          nullable: true
+          description: GPU 型號
+          example: "NVIDIA GeForce RTX 3090"
+        gpu_memory_gb:
+          type: number
+          format: float
+          nullable: true
+          description: GPU 顯示記憶體（GB）
+          example: 24.0
+        hf_token_set:
+          type: boolean
+          description: HF_TOKEN 是否已設定
+          example: true
+        groq_key_set:
+          type: boolean
+          description: GROQ_API_KEY 是否已設定
+          example: true
+
+    ErrorResponse:
+      type: object
+      description: 錯誤回應
+      required:
+        - detail
+      properties:
+        detail:
+          type: string
+          description: 錯誤訊息
+          example: "找不到工作 550e8400-e29b-41d4-a716-446655440000"
