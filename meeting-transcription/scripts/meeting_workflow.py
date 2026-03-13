@@ -163,8 +163,24 @@ def transcribe_local(audio_path: Path, num_speakers: int = None) -> str:
 
 
 # ──────────────────────────────────────────────────────────
-# 會議記錄生成
+# 內容分類 & 筆記生成
 # ──────────────────────────────────────────────────────────
+
+CLASSIFICATION_PROMPT = """
+你是一位內容分析師。請根據以下逐字稿內容，判斷這份錄音屬於哪一類別：
+
+1. 商務會議 — 公司內部討論、決策、報告、跨部門協作、專案管理等
+2. 訪談與使用者研究類 (User Research) — UX 訪談、記者採訪、口述歷史、消費者研究等
+3. 知識學習與演講類 — 線上課程、Podcast、技術研討會、TED Talk、講座等
+4. 其他 — 無法歸入以上三類（請簡述類型，例如：心理諮詢、法律會談、銷售電話等）
+
+請僅回覆以下格式（不加任何解釋）：
+類別編號: <數字>
+類別名稱: <名稱>
+說明: <一句話描述>
+
+逐字稿如下：
+"""
 
 MINUTES_PROMPT = """
 你是一位專業的會議記錄整理員。
@@ -201,7 +217,143 @@ MINUTES_PROMPT = """
 逐字稿如下：
 """
 
+USER_RESEARCH_PROMPT = """
+你是一位 UX 研究分析師。請根據以下訪談逐字稿，整理成結構化的研究報告（繁體中文）。
+
+報告須包含以下章節（Markdown 格式，使用 ## 標題）：
+
+## 痛點提取 (Pain Points)
+條列受訪者在過程中提到的困難、不滿或障礙。
+
+## 需求與期望 (Needs & Desires)
+條列受訪者明確表達希望擁有的功能、服務或改善點。
+
+## 情感分析 (Sentiment Analysis)
+識別受訪者在談論特定主題時的情緒波動，以表格呈現：
+
+| 主題 | 情緒傾向 | 關鍵描述 |
+|---|---|---|
+| （主題） | 興奮／挫折／猶豫／中立 | （相關語句） |
+
+## 逐字稿精簡 (Clean Verbatim)
+去除贅字（如：那個、然後、呃、嗯...）後的流暢對話紀錄，保留說話者標記與時間戳記。
+
+---
+注意：英文專有名詞保留英文原文。若人名不明確，以 Speaker N 代稱。
+
+逐字稿如下：
+"""
+
+KNOWLEDGE_PROMPT = """
+你是一位知識整理專家。請根據以下演講／課程逐字稿，整理成結構化的學習筆記（繁體中文）。
+
+筆記須包含以下章節（Markdown 格式，使用 ## 標題）：
+
+## 概念解釋 (Concept Definitions)
+針對錄音中出現的專業術語或核心概念進行定義，格式：
+**術語名稱**：定義說明
+
+## 結構化大綱 (Structured Outline)
+將長篇錄音轉化為具備層級的文章架構：
+
+# H1 主題
+## H2 子主題
+### H3 細節
+
+## 重點金句 (Quotes)
+提取具有啟發性或最適合分享的短句（每條加引號，附說話者與時間點）。
+
+## 問答總結 (Q&A Summary)
+若有互動環節，以 Q: / A: 格式分別整理觀眾提問與講者回答。
+若無互動環節，此節填「無互動環節」。
+
+---
+注意：英文專有名詞保留英文原文。
+
+逐字稿如下：
+"""
+
+GENERIC_NOTES_PROMPT = """
+你是一位專業的內容整理員。這份逐字稿的類型為：{content_type}
+
+請根據此類型，自動判斷最適合的整理結構，輸出繁體中文的結構化筆記。
+至少包含以下幾個方面：
+- 核心摘要（3-8 條重點）
+- 主要內容整理（依最適合此類型的方式分章節呈現）
+- 重要資訊或行動項目（若適用）
+
+使用 Markdown 格式（## 標題層級）。
+英文專有名詞保留英文原文。
+
+逐字稿如下：
+"""
+
+# 分類編號 → (Label, 檔名後綴, Prompt)
+_CATEGORY_MAP = {
+    "1": ("會議記錄", "_會議記錄", MINUTES_PROMPT),
+    "2": ("研究報告", "_研究報告", USER_RESEARCH_PROMPT),
+    "3": ("學習筆記", "_學習筆記", KNOWLEDGE_PROMPT),
+}
+
+
+def classify_transcript(transcript: str, model: str) -> dict:
+    """分析逐字稿類型，回傳 {'num', 'name', 'desc', 'label', 'suffix', 'prompt'}"""
+    from google import genai as gai
+    check_env("GEMINI_API_KEY")
+    client = gai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+    print("[3/5] 分析錄音類型...")
+    # 取前 3000 字即可判斷類型
+    response = client.models.generate_content(
+        model=model,
+        contents=CLASSIFICATION_PROMPT + transcript[:3000]
+    )
+    text = response.text.strip()
+
+    result = {"num": "1", "name": "商務會議", "desc": ""}
+    for line in text.splitlines():
+        if "類別編號:" in line:
+            result["num"] = line.split(":", 1)[1].strip()
+        elif "類別名稱:" in line:
+            result["name"] = line.split(":", 1)[1].strip()
+        elif "說明:" in line:
+            result["desc"] = line.split(":", 1)[1].strip()
+
+    num = result["num"]
+    if num in _CATEGORY_MAP:
+        label, suffix, prompt = _CATEGORY_MAP[num]
+    else:
+        label, suffix = "整理筆記", "_整理筆記"
+        prompt = GENERIC_NOTES_PROMPT.format(content_type=result["name"])
+
+    result["label"] = label
+    result["suffix"] = suffix
+    result["prompt"] = prompt
+
+    print(f"[✓] 類型: {num}. {result['name']} — {result['desc']}  →  產出: {label}")
+    return result
+
+
+def generate_notes(transcript: str, model: str, category: dict) -> str:
+    """依分類結果生成對應格式的筆記，回傳 Markdown 字串"""
+    from google import genai as gai
+    check_env("GEMINI_API_KEY")
+    client = gai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+    label = category.get("label", "會議記錄")
+    prompt = category.get("prompt", MINUTES_PROMPT)
+
+    print(f"[4/5] 生成{label}（Gemini）...")
+    response = client.models.generate_content(
+        model=model,
+        contents=prompt + transcript
+    )
+    return response.text.strip()
+
+
+# ── 保留舊名稱作為相容別名 ──────────────────────────────────
 def generate_minutes(transcript: str, model: str) -> str:
+    """相容舊流程：直接以商務會議 prompt 生成會議記錄"""
     from google import genai as gai
     check_env("GEMINI_API_KEY")
     client = gai.Client(api_key=os.environ["GEMINI_API_KEY"])
@@ -319,7 +471,22 @@ def main():
     out_dir = audio_path.parent / base_name
     out_dir.mkdir(parents=True, exist_ok=True)
     transcript_path = out_dir / f"{base_name}_逐字稿.md"
-    minutes_path = out_dir / f"{base_name}_會議記錄.md"
+    meta_path = out_dir / f"{base_name}_meta.json"
+
+    # ── 讀取或設定預設 meta（供 email step 使用）─────────────
+    def load_meta() -> dict:
+        import json
+        if meta_path.exists():
+            return json.loads(meta_path.read_text(encoding="utf-8"))
+        return {"label": "會議記錄", "suffix": "_會議記錄"}
+
+    def save_meta(category: dict):
+        import json
+        meta_path.write_text(
+            json.dumps({"label": category["label"], "suffix": category["suffix"]},
+                       ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
 
     # ── Step: transcribe ──────────────────────────────────
     if args.step in ("all", "transcribe"):
@@ -332,32 +499,45 @@ def main():
         transcript_path.write_text(transcript, encoding="utf-8")
         print(f"[✓] 逐字稿已存: {transcript_path}")
 
-    # ── Step: minutes（僅 gemini 模式 or --step all + gemini）─
+    # ── Step: classify + generate notes（僅 gemini all 模式）─
     if args.step == "all" and args.mode == "gemini":
         check_env("GEMINI_API_KEY")
         transcript = transcript_path.read_text(encoding="utf-8")
-        minutes = generate_minutes(transcript, args.model)
-        minutes_full = f"# {base_name} 會議記錄\n\n" + minutes
-        minutes_path.write_text(minutes_full, encoding="utf-8")
-        print(f"[✓] 會議記錄已存: {minutes_path}")
+        category = classify_transcript(transcript, args.model)
+        save_meta(category)
+        notes = generate_notes(transcript, args.model, category)
+        notes_filename = f"{base_name}{category['suffix']}.md"
+        notes_path = out_dir / notes_filename
+        notes_full = f"# {base_name} {category['label']}\n\n" + notes
+        notes_path.write_text(notes_full, encoding="utf-8")
+        print(f"[✓] {category['label']}已存: {notes_path}")
 
-    # ── Step: transcribe only（本地模式）→ 結束，交由 Agent 生成會議記錄 ──
+    # ── Step: transcribe only（本地模式）→ 結束，交由 Agent 分類並生成筆記 ──
     if args.step == "transcribe":
-        print(f"\n✅ 轉錄完成！請 Agent 讀取逐字稿並生成會議記錄：\n   {transcript_path}")
-        print(f"   會議記錄請寫入：{minutes_path}")
+        print(f"\n✅ 轉錄完成！請 Agent 讀取逐字稿、分類後生成對應筆記：\n   {transcript_path}")
         print(f"   完成後執行寄信：python3 {__file__} {audio_path} --step email")
         return
 
     # ── Step: email ───────────────────────────────────────
     if args.step in ("all", "email"):
-        if not minutes_path.exists():
-            print(f"[錯誤] 找不到會議記錄檔：{minutes_path}")
-            print("請先生成會議記錄再執行寄信步驟。")
-            sys.exit(1)
-        minutes_full = minutes_path.read_text(encoding="utf-8")
-        print("[*] 轉換會議記錄為 HTML ...")
-        html_body = minutes_to_html(minutes_full, base_name)
-        subject = f"【會議記錄】{base_name}"
+        meta = load_meta()
+        label = meta.get("label", "會議記錄")
+        suffix = meta.get("suffix", "_會議記錄")
+        notes_path = out_dir / f"{base_name}{suffix}.md"
+        if not notes_path.exists():
+            # Fallback: 嘗試舊版 _會議記錄.md
+            fallback = out_dir / f"{base_name}_會議記錄.md"
+            if fallback.exists():
+                notes_path = fallback
+                label = "會議記錄"
+            else:
+                print(f"[錯誤] 找不到筆記檔：{notes_path}")
+                print("請先生成筆記再執行寄信步驟。")
+                sys.exit(1)
+        notes_full = notes_path.read_text(encoding="utf-8")
+        print(f"[*] 轉換 {label} 為 HTML ...")
+        html_body = minutes_to_html(notes_full, base_name)
+        subject = f"【{label}】{base_name}"
         send_email(recipients, subject, html_body, transcript_path)
 
     print(f"\n✅ 完成！輸出位於: {out_dir}")
