@@ -51,6 +51,8 @@ tags:
     description: 提交音訊並啟動轉錄任務
   - name: 工作管理
     description: 查詢、列出、刪除工作
+  - name: 聲紋庫
+    description: Speaker 聲紋註冊與管理（Enrollment-based Speaker Identification）
   - name: 系統
     description: 健康檢查與服務狀態
 
@@ -390,6 +392,144 @@ paths:
           $ref: "#/components/responses/Unauthorized"
 
   # -------------------------------------------------------------------------
+  # POST /speakers/enroll
+  # -------------------------------------------------------------------------
+  /speakers/enroll:
+    post:
+      tags: [聲紋庫]
+      summary: 註冊 Speaker 聲紋
+      description: |
+        上傳 **10–15 秒**單人清晰錄音，提取聲紋 embedding（512 維 ECAPA-TDNN 向量）
+        並存入聲紋庫（`/app/speaker_profiles/{name}.json`）。
+
+        後續所有轉錄任務將自動比對聲紋庫，將 `Speaker 1`、`Speaker 2` 等
+        匿名標籤置換為已知的 Speaker 名稱。
+
+        **建議錄音條件**：
+        - 安靜環境、清晰發音
+        - 單人錄音，10–15 秒（太短影響準確率）
+        - 與實際會議使用的麥克風相同或相近
+
+        **注意**：使用相同名稱重複上傳將**覆蓋**既有的聲紋資料。
+
+        **模型**：`pyannote/embedding`（需在 Hugging Face 接受使用條款）
+      operationId: enrollSpeaker
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - audio
+                - name
+              properties:
+                audio:
+                  type: string
+                  format: binary
+                  description: 10–15 秒單人錄音（wav / mp3 / m4a 等）
+                name:
+                  type: string
+                  description: Speaker 名稱（英數字、中文、底線、連字號、空格）
+                  example: Alice
+                device:
+                  type: string
+                  default: auto
+                  enum: [auto, cpu, cuda]
+                  description: 提取 embedding 使用的裝置（auto 自動選擇）
+      responses:
+        "201":
+          description: 註冊成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnrollResponse"
+              example:
+                name: Alice
+                message: "Speaker Alice 註冊成功。"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          description: 聲紋提取失敗（HF_TOKEN 未設定或模型載入失敗）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                detail: "聲紋提取失敗：HF_TOKEN 未設定"
+
+  # -------------------------------------------------------------------------
+  # GET /speakers
+  # -------------------------------------------------------------------------
+  /speakers:
+    get:
+      tags: [聲紋庫]
+      summary: 列出已註冊的 Speaker
+      description: 列出聲紋庫中所有已註冊的 Speaker（依名稱排序，不含 embedding 向量）。
+      operationId: listSpeakers
+      responses:
+        "200":
+          description: Speaker 清單
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SpeakerListResponse"
+              example:
+                total: 2
+                speakers:
+                  - name: Alice
+                    source_file: alice_sample.wav
+                    dim: 512
+                  - name: Bob
+                    source_file: bob_sample.mp3
+                    dim: 512
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # -------------------------------------------------------------------------
+  # DELETE /speakers/{name}
+  # -------------------------------------------------------------------------
+  /speakers/{name}:
+    delete:
+      tags: [聲紋庫]
+      summary: 刪除 Speaker 聲紋
+      description: |
+        從聲紋庫中移除指定 Speaker 的聲紋資料。
+
+        刪除後，後續轉錄任務不再辨識該 Speaker，相關語段將
+        回退顯示為 `Speaker N` 匿名標籤。
+      operationId: deleteSpeaker
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Speaker 名稱
+          example: Alice
+      responses:
+        "200":
+          description: 刪除成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeleteResponse"
+              example:
+                message: "Speaker Alice 已從聲紋庫刪除。"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: 找不到指定的 Speaker
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                detail: "找不到 Speaker：Alice"
+
+  # -------------------------------------------------------------------------
   # GET /health
   # -------------------------------------------------------------------------
   /health:
@@ -658,6 +798,60 @@ components:
           type: boolean
           description: GROQ_API_KEY 是否已設定
           example: true
+
+    SpeakerProfile:
+      type: object
+      description: 已註冊的 Speaker 聲紋摘要（不含 embedding 向量）
+      required:
+        - name
+        - source_file
+        - dim
+      properties:
+        name:
+          type: string
+          description: Speaker 名稱
+          example: Alice
+        source_file:
+          type: string
+          description: 註冊時使用的音檔名稱
+          example: alice_sample.wav
+        dim:
+          type: integer
+          description: Embedding 向量維度
+          example: 512
+
+    SpeakerListResponse:
+      type: object
+      description: GET /speakers 的回應
+      required:
+        - total
+        - speakers
+      properties:
+        total:
+          type: integer
+          description: 已註冊 Speaker 人數
+          example: 2
+        speakers:
+          type: array
+          description: Speaker 清單（依名稱排序）
+          items:
+            $ref: "#/components/schemas/SpeakerProfile"
+
+    EnrollResponse:
+      type: object
+      description: POST /speakers/enroll 的回應
+      required:
+        - name
+        - message
+      properties:
+        name:
+          type: string
+          description: 已註冊的 Speaker 名稱
+          example: Alice
+        message:
+          type: string
+          description: 說明訊息
+          example: "Speaker Alice 註冊成功。"
 
     ErrorResponse:
       type: object

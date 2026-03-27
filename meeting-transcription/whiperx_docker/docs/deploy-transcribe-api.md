@@ -14,10 +14,11 @@
 6. [首次啟動](#6-首次啟動)
 7. [確認服務正常](#7-確認服務正常)
 8. [API 使用方式](#8-api-使用方式)
-9. [Nginx 反向代理 + HTTPS（選用）](#9-nginx-反向代理--https選用)
-10. [常用維護指令](#10-常用維護指令)
-11. [常見問題排查](#11-常見問題排查)
-12. [目錄結構說明](#12-目錄結構說明)
+9. [聲紋庫 API（Speaker Enrollment）](#9-聲紋庫-apispeaker-enrollment)
+10. [Nginx 反向代理 + HTTPS（選用）](#10-nginx-反向代理--https選用)
+11. [常用維護指令](#11-常用維護指令)
+12. [常見問題排查](#12-常見問題排查)
+13. [目錄結構說明](#13-目錄結構說明)
 
 ---
 
@@ -146,6 +147,7 @@ API_KEY=your-secret-api-key-here
 **取得 HF_TOKEN：**
 1. 前往 https://huggingface.co/settings/tokens → 建立 **Read** 權限的 Token
 2. 前往 https://huggingface.co/pyannote/speaker-diarization-community-1 → 點擊 **Agree and access repository**
+3. 前往 https://huggingface.co/pyannote/embedding → 點擊 **Agree and access repository**（聲紋比對功能需要）
 
 **產生隨機 API_KEY：**
 ```bash
@@ -325,7 +327,7 @@ curl -X DELETE http://<server-ip>:8787/jobs/550e8400-e29b-41d4-a716-446655440000
 
 ---
 
-### Python 輪詢範例
+### Python 輪詢範例（含聲紋比對）
 
 ```python
 import time
@@ -367,7 +369,135 @@ print("已儲存 transcript.md")
 
 ---
 
-## 9. Nginx 反向代理 + HTTPS（選用）
+## 9. 聲紋庫 API（Speaker Enrollment）
+
+### 概述
+
+聲紋庫功能讓系統能將轉錄結果中的匿名標籤（`Speaker 1`、`Speaker 2`）
+自動置換為真實姓名。
+
+**流程：**
+```
+1. 上傳每位 Speaker 的 10-15 秒錄音 → POST /speakers/enroll
+2. 照常呼叫 POST /transcribe 上傳會議錄音
+3. 系統自動比對聲紋，逐字稿中直接顯示姓名
+```
+
+**技術細節：**
+- 使用 `pyannote/embedding`（ECAPA-TDNN）提取 512 維聲紋向量
+- 以 cosine similarity 比對，預設閾值 `0.75`（可用 `SPEAKER_SIMILARITY_THRESHOLD` 環境變數調整）
+- 未達閾值的語段仍顯示為 `Speaker N`
+
+---
+
+### 步驟一：確認 HF 使用條款
+
+除了 diarization 模型外，還需額外接受 embedding 模型的使用條款：
+
+前往 https://huggingface.co/pyannote/embedding → 點擊 **Agree and access repository**
+
+---
+
+### 步驟二：註冊 Speaker
+
+```bash
+# Linux / macOS
+curl -X POST http://<server-ip>:8787/speakers/enroll \
+  -F "name=Alice" \
+  -F "audio=@/path/to/alice_sample.wav"
+
+# Windows CMD
+curl -X POST http://<server-ip>:8787/speakers/enroll ^
+  -F "name=Alice" ^
+  -F "audio=@C:\path\to\alice_sample.wav"
+```
+
+**回應（HTTP 201）：**
+```json
+{
+  "name": "Alice",
+  "message": "Speaker Alice 註冊成功。"
+}
+```
+
+| 參數 | 型別 | 必填 | 說明 |
+|------|------|------|------|
+| `audio` | file | ✓ | 10–15 秒單人錄音（wav / mp3 / m4a 等）|
+| `name`  | string | ✓ | Speaker 名稱（英數字、中文、底線、連字號）|
+| `device` | string | | `auto`（預設）/ `cpu` / `cuda` |
+
+> **注意**：第一次呼叫時會從 HuggingFace 下載 `pyannote/embedding` 模型（約 300 MB），請耐心等待。
+
+---
+
+### 步驟三：確認已註冊的 Speaker
+
+```bash
+curl http://<server-ip>:8787/speakers
+```
+
+**回應：**
+```json
+{
+  "total": 2,
+  "speakers": [
+    {"name": "Alice", "source_file": "alice_sample.wav", "dim": 512},
+    {"name": "Bob",   "source_file": "bob_sample.mp3",   "dim": 512}
+  ]
+}
+```
+
+---
+
+### 步驟四：上傳會議錄音（照常操作）
+
+```bash
+curl -X POST http://<server-ip>:8787/transcribe \
+  -F "audio=@meeting.mp3" \
+  -F "lang=zh"
+```
+
+聲紋比對在背景自動執行，逐字稿中會直接顯示姓名：
+
+```markdown
+**[00:00:05 → 00:00:32] Alice:**
+大家好，今天我們來討論第一季的業績報告。
+
+**[00:00:33 → 00:01:10] Bob:**
+好的，根據數據顯示，本季營收成長了 15%。
+
+**[00:01:11 → 00:01:45] Speaker 3:**
+（未辨識的語者仍顯示為 Speaker N）
+```
+
+---
+
+### 刪除 Speaker
+
+```bash
+curl -X DELETE http://<server-ip>:8787/speakers/Alice
+```
+
+**回應：**
+```json
+{"message": "Speaker Alice 已從聲紋庫刪除。"}
+```
+
+---
+
+### 調整比對閾值
+
+在 `.env` 修改後重啟容器：
+
+```ini
+# 調低（如 0.65）：更容易比對到，但可能誤判
+# 調高（如 0.85）：更嚴格，僅在非常確定時才置換
+SPEAKER_SIMILARITY_THRESHOLD=0.75
+```
+
+---
+
+## 10. Nginx 反向代理 + HTTPS（選用）
 
 若需要對外公開服務或使用 HTTPS：
 
@@ -402,7 +532,7 @@ sudo certbot --nginx -d your-domain.com
 
 ---
 
-## 10. 常用維護指令
+## 11. 常用維護指令
 
 ```bash
 # 查看即時日誌
@@ -432,7 +562,7 @@ docker system df -v
 
 ---
 
-## 11. 常見問題排查
+## 12. 常見問題排查
 
 ### GPU 在容器內無法使用
 
@@ -463,6 +593,24 @@ print('OK')
 常見原因：
 1. **未接受使用條款** → 前往 https://huggingface.co/pyannote/speaker-diarization-community-1 點擊 Agree
 2. **Token 沒有 Read 權限** → 重新在 HF 產生有 Read 權限的 Token
+
+### 聲紋比對失敗：`name 'AudioDecoder' is not defined`
+
+這是 `pyannote.audio` 某些版本的 circular import bug，`speaker_db.py` 已透過
+用 `librosa` 手動載入音訊（傳 `{"waveform": tensor, "sample_rate": 16000}`）來繞過此問題。
+
+若仍遇到此錯誤，請確認容器內的 `speaker_db.py` 是最新版本：
+
+```bash
+docker cp scripts/speaker_db.py transcribe-api:/app/speaker_db.py
+docker restart transcribe-api
+```
+
+### 聲紋比對失敗：`HF_TOKEN 未設定`
+
+`.env` 中的 `HF_TOKEN` 需要同時接受以下兩個模型的使用條款：
+- `pyannote/speaker-diarization-community-1`（diarization）
+- `pyannote/embedding`（enrollment 聲紋比對）
 
 ### 容器啟動後立刻退出
 
@@ -496,7 +644,7 @@ docker compose restart
 
 ---
 
-## 12. 目錄結構說明
+## 13. 目錄結構說明
 
 ```
 ~/transcribe-api/
@@ -506,15 +654,17 @@ docker compose restart
 ├── .env.example                 # 環境變數範本
 ├── scripts/
 │   ├── transcribe_diarize.py    # 核心：WhisperX 轉錄 + 語者分離邏輯
-│   └── transcribe_api.py        # FastAPI 服務主程式
+│   ├── transcribe_api.py        # FastAPI 服務主程式
+│   └── speaker_db.py            # 聲紋庫：enrollment + 聲紋比對邏輯
 └── docs/
     ├── api-spec.yaml            # OpenAPI 3.0 完整規格文件
     └── deploy-transcribe-api.md # 本文件
 
 # Docker Volumes（資料持久化）
 volumes/
-├── hf_cache    # HuggingFace 模型快取（~5 GB，重啟後不重複下載）
-├── uploads     # 音訊暫存（轉錄完成後自動刪除）
+├── hf_cache         # HuggingFace 模型快取（~5 GB，重啟後不重複下載）
+├── uploads          # 音訊暫存（轉錄完成後自動刪除）
+├── speaker_profiles # 聲紋庫（{name}.json，每人約 8 KB）
 └── outputs/
     ├── _jobs/           # 工作狀態 JSON（job_id.json）
     └── <job_id>/        # 每個工作的輸出

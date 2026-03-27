@@ -40,12 +40,14 @@ from pydantic import BaseModel, Field
 
 UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", "/app/uploads"))
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/app/outputs"))
+SPEAKER_DIR = Path(os.environ.get("SPEAKER_DIR", "/app/speaker_profiles"))
 MAX_FILE_MB = int(os.environ.get("MAX_FILE_MB", "500"))
 JOB_TTL_HOURS = int(os.environ.get("JOB_TTL_HOURS", "48"))
 API_KEY = os.environ.get("API_KEY", "")
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+SPEAKER_DIR.mkdir(parents=True, exist_ok=True)
 
 ALLOWED_EXTENSIONS = {".mp3", ".mp4", ".wav", ".m4a", ".ogg", ".flac", ".webm", ".aac"}
 
@@ -185,6 +187,28 @@ class ErrorResponse(BaseModel):
     detail: str = Field(description="錯誤訊息", examples=["找不到工作 550e8400..."])
 
 
+class SpeakerProfile(BaseModel):
+    """已註冊的 Speaker 聲紋資訊"""
+
+    name: str = Field(description="Speaker 名稱", examples=["Alice"])
+    source_file: str = Field(description="註冊時使用的音檔名稱", examples=["alice.wav"])
+    dim: int = Field(description="Embedding 向量維度", examples=[512])
+
+
+class SpeakerListResponse(BaseModel):
+    """GET /speakers 的回應"""
+
+    total: int = Field(description="已註冊 Speaker 人數", examples=[3])
+    speakers: List[SpeakerProfile] = Field(description="Speaker 清單（依名稱排序）")
+
+
+class EnrollResponse(BaseModel):
+    """POST /speakers/enroll 的回應"""
+
+    name: str = Field(description="已註冊的 Speaker 名稱", examples=["Alice"])
+    message: str = Field(description="說明訊息", examples=["Speaker Alice 註冊成功。"])
+
+
 # ---------------------------------------------------------------------------
 # Job 讀寫工具
 # ---------------------------------------------------------------------------
@@ -272,6 +296,8 @@ def _run_transcription(job_id: str, audio_path: Path, record: JobRecord):
         cmd += ["--num-speakers", str(record.num_speakers)]
     if not record.add_punctuation:
         cmd.append("--no-punctuation")
+    if SPEAKER_DIR.exists() and any(SPEAKER_DIR.glob("*.json")):
+        cmd += ["--speaker-dir", str(SPEAKER_DIR)]
 
     log_path = out_base / "subprocess.log"
     print(f"[{job_id}] 啟動 subprocess: {' '.join(cmd)}", flush=True)
@@ -339,6 +365,8 @@ async def lifespan(app: FastAPI):
     yield
 
 
+ALLOWED_ENROLL_EXTENSIONS = {".mp3", ".mp4", ".wav", ".m4a", ".ogg", ".flac", ".webm", ".aac"}
+
 app = FastAPI(
     title="WhisperX 語音轉錄 API",
     description="""
@@ -374,6 +402,7 @@ GET /jobs/{job_id}/result  → 下載 Markdown
     openapi_tags=[
         {"name": "轉錄", "description": "提交音訊並管理轉錄任務"},
         {"name": "工作管理", "description": "查詢、列出、刪除工作"},
+        {"name": "聲紋庫", "description": "Speaker 聲紋註冊與管理"},
         {"name": "系統", "description": "健康檢查與服務狀態"},
     ],
     lifespan=lifespan,
@@ -646,6 +675,148 @@ def list_all_jobs(
     if status:
         records = [r for r in records if r.status == status]
     return JobListResponse(total=len(records), jobs=records)
+
+
+# ---------------------------------------------------------------------------
+# 聲紋庫 Routes
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/speakers/enroll",
+    tags=["聲紋庫"],
+    summary="註冊 Speaker 聲紋",
+    description="""
+上傳 **10–15 秒**單人錄音，提取聲紋 embedding 並存入聲紋庫。
+
+後續轉錄任務將自動比對聲紋庫，將 `Speaker 1`、`Speaker 2` 等標籤
+置換為已知的 Speaker 名稱。
+
+**建議錄音條件**：
+- 安靜環境、清晰發音
+- 10–15 秒（太短會影響準確率）
+- 與實際會議使用的麥克風相同或相近
+
+**注意**：若使用相同名稱重複上傳，將**覆蓋**既有的聲紋資料。
+""",
+    response_model=EnrollResponse,
+    status_code=201,
+    responses={
+        201: {"description": "註冊成功", "model": EnrollResponse},
+        400: {"description": "檔案格式錯誤或名稱無效", "model": ErrorResponse},
+        401: {"description": "API Key 錯誤", "model": ErrorResponse},
+        500: {"description": "聲紋提取失敗（HF_TOKEN 未設定或模型載入失敗）", "model": ErrorResponse},
+    },
+    dependencies=[Depends(verify_api_key)],
+)
+async def enroll_speaker(
+    audio: UploadFile = File(
+        ...,
+        description="10–15 秒單人錄音（wav / mp3 / m4a 等）",
+    ),
+    name: str = Form(
+        ...,
+        description="Speaker 名稱（英文或中文，不含 / \\ . 等特殊字元）",
+        examples=["Alice"],
+    ),
+    device: str = Form(
+        default="auto",
+        description="提取 embedding 使用的裝置（auto / cpu / cuda）",
+    ),
+):
+    # 驗證名稱
+    import re
+    if not name or not re.match(r'^[\w\u4e00-\u9fff\- ]+$', name):
+        raise HTTPException(
+            status_code=400,
+            detail="名稱無效：僅允許英數字、中文、底線、連字號、空格。",
+        )
+
+    suffix = Path(audio.filename or "").suffix.lower()
+    if suffix not in ALLOWED_ENROLL_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支援的格式：{suffix}。支援：{', '.join(sorted(ALLOWED_ENROLL_EXTENSIONS))}",
+        )
+
+    hf_token = os.environ.get("HF_TOKEN", "")
+    if not hf_token:
+        raise HTTPException(status_code=500, detail="HF_TOKEN 未設定，無法載入 pyannote/embedding 模型。")
+
+    # 儲存上傳音訊
+    enroll_path = UPLOAD_DIR / f"enroll_{name}{suffix}"
+    with open(enroll_path, "wb") as f:
+        content = await audio.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="上傳檔案為空。")
+    enroll_path.write_bytes(content)
+
+    try:
+        resolved_device = device
+        if device == "auto":
+            try:
+                import torch
+                resolved_device = "cuda" if torch.cuda.is_available() else "cpu"
+            except ImportError:
+                resolved_device = "cpu"
+
+        from speaker_db import enroll_speaker as _enroll
+        _enroll(
+            name=name,
+            audio_path=enroll_path,
+            speaker_dir=SPEAKER_DIR,
+            hf_token=hf_token,
+            device=resolved_device,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"聲紋提取失敗：{e}")
+    finally:
+        enroll_path.unlink(missing_ok=True)
+
+    return JSONResponse(
+        status_code=201,
+        content=EnrollResponse(
+            name=name,
+            message=f"Speaker {name} 註冊成功。",
+        ).model_dump(),
+    )
+
+
+@app.get(
+    "/speakers",
+    tags=["聲紋庫"],
+    summary="列出已註冊的 Speaker",
+    description="列出聲紋庫中所有已註冊的 Speaker（不含 embedding 向量）。",
+    response_model=SpeakerListResponse,
+    responses={
+        200: {"description": "Speaker 清單", "model": SpeakerListResponse},
+        401: {"description": "API Key 錯誤", "model": ErrorResponse},
+    },
+    dependencies=[Depends(verify_api_key)],
+)
+def list_speakers():
+    from speaker_db import list_speaker_profiles
+    speakers = list_speaker_profiles(SPEAKER_DIR)
+    return SpeakerListResponse(total=len(speakers), speakers=speakers)
+
+
+@app.delete(
+    "/speakers/{name}",
+    tags=["聲紋庫"],
+    summary="刪除 Speaker 聲紋",
+    description="從聲紋庫中移除指定 Speaker 的聲紋資料。",
+    response_model=DeleteResponse,
+    responses={
+        200: {"description": "刪除成功", "model": DeleteResponse},
+        401: {"description": "API Key 錯誤", "model": ErrorResponse},
+        404: {"description": "找不到 Speaker", "model": ErrorResponse},
+    },
+    dependencies=[Depends(verify_api_key)],
+)
+def delete_speaker(name: str):
+    from speaker_db import delete_speaker as _delete
+    if not _delete(name, SPEAKER_DIR):
+        raise HTTPException(status_code=404, detail=f"找不到 Speaker：{name}")
+    return DeleteResponse(message=f"Speaker {name} 已從聲紋庫刪除。")
 
 
 # ---------------------------------------------------------------------------

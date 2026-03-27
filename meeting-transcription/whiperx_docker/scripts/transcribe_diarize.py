@@ -76,18 +76,28 @@ def format_timestamp(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def normalize_speaker_labels(segments: list) -> dict:
+def normalize_speaker_labels(segments: list, name_map: dict = None) -> dict:
     """
-    將 Pyannote 原始語者 ID（如 SPEAKER_00）映射為
-    連續的 Speaker 1、Speaker 2、...（依首次出現順序）。
+    將 Pyannote 原始語者 ID（如 SPEAKER_00）映射為顯示名稱。
+
+    優先順序：
+      1. name_map 中有的 → 使用已註冊的 Speaker 名稱（e.g. "Alice"）
+      2. 其餘 → 依首次出現順序編號（"Speaker 1", "Speaker 2", ...）
+
+    Args:
+        segments: WhisperX 輸出的 segments list，每段含 "speaker" 欄位
+        name_map: 聲紋比對結果 {SPEAKER_00: "Alice"}（可選）
     """
     mapping = {}
     counter = 1
     for seg in segments:
         raw = seg.get("speaker", "UNKNOWN")
         if raw not in mapping:
-            mapping[raw] = f"Speaker {counter}"
-            counter += 1
+            if name_map and raw in name_map:
+                mapping[raw] = name_map[raw]
+            else:
+                mapping[raw] = f"Speaker {counter}"
+                counter += 1
     return mapping
 
 
@@ -221,6 +231,7 @@ def transcribe_with_diarization(
     language: str = "zh",
     device: str = "auto",
     num_speakers: int = None,
+    speaker_dir: Path = None,
 ) -> tuple:
     """
     使用 WhisperX 進行轉錄 + 語者分離。
@@ -314,7 +325,23 @@ def transcribe_with_diarization(
     result = whisperx.assign_word_speakers(diarize_segments, result)
     segments = result.get("segments", [])
 
-    speaker_map = normalize_speaker_labels(segments)
+    # Step 5: 聲紋比對（若有聲紋庫）
+    name_map = {}
+    if speaker_dir and speaker_dir.exists():
+        print("聲紋比對中...")
+        try:
+            from speaker_db import match_diarized_speakers
+            name_map = match_diarized_speakers(
+                diarize_segments=diarize_segments,
+                audio=audio,
+                speaker_dir=speaker_dir,
+                hf_token=hf_token,
+                device=resolved_device,
+            )
+        except Exception as e:
+            print(f"警告：聲紋比對失敗（{e}），使用預設 Speaker 編號。", file=sys.stderr)
+
+    speaker_map = normalize_speaker_labels(segments, name_map=name_map)
     print(f"辨識到 {len(speaker_map)} 位語者：{list(speaker_map.values())}")
 
     return segments, speaker_map, detected_language, duration
@@ -333,6 +360,8 @@ def main():
                         help="指定語者人數（選填；不指定則自動偵測）")
     parser.add_argument("--no-punctuation", action="store_true",
                         help="跳過標點補強步驟（預設：自動補標點)")
+    parser.add_argument("--speaker-dir", default=None,
+                        help="聲紋庫目錄路徑（選填；設定後啟用聲紋比對功能）")
     args = parser.parse_args()
 
     audio_path = Path(args.audio_file).resolve()
@@ -346,11 +375,14 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"建立資料夾: {output_dir}")
 
+    speaker_dir = Path(args.speaker_dir) if args.speaker_dir else None
+
     segments, speaker_map, language, duration = transcribe_with_diarization(
         audio_path,
         language=args.lang,
         device=args.device,
         num_speakers=args.num_speakers,
+        speaker_dir=speaker_dir,
     )
 
     add_punct = not args.no_punctuation

@@ -24,18 +24,22 @@ RUN pip install --no-cache-dir \
         "uvicorn[standard]" \
         python-multipart \
         funasr \
-        deepmultilingualpunctuation
+        deepmultilingualpunctuation \
+        soundfile
 
 # ---- 複製服務腳本 ----
 COPY scripts/transcribe_diarize.py /app/
 COPY scripts/transcribe_api.py /app/
+COPY scripts/speaker_db.py /app/
 
 # ---- 資料目錄 ----
-RUN mkdir -p /app/uploads /app/outputs
+RUN mkdir -p /app/uploads /app/outputs /app/speaker_profiles
 
 # ---- 環境變數預設值（可由 docker-compose .env 覆蓋）----
 ENV UPLOAD_DIR=/app/uploads \
     OUTPUT_DIR=/app/outputs \
+    SPEAKER_DIR=/app/speaker_profiles \
+    SPEAKER_SIMILARITY_THRESHOLD=0.75 \
     MAX_FILE_MB=500 \
     JOB_TTL_HOURS=48 \
     PORT=8000

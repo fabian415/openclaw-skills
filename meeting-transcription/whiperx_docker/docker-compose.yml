@@ -19,6 +19,8 @@ services:
       - uploads:/app/uploads
       # 輸出結果：逐字稿 Markdown + 工作狀態 JSON
       - outputs:/app/outputs
+      # 聲紋庫：已註冊 Speaker 的 embedding JSON
+      - speaker_profiles:/app/speaker_profiles
       # HuggingFace 模型快取（WhisperX / Pyannote）
       - hf_cache:/root/.cache/huggingface
       # ModelScope 模型快取（FunASR CT-Punc，~1 GB）
@@ -50,5 +52,6 @@ services:
 volumes:
   uploads:
   outputs:
+  speaker_profiles:
   hf_cache:
   modelscope_cache:
