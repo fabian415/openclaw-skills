@@ -40,10 +40,50 @@ Output:
 """
 
 import argparse
+import csv
 import gc
 import os
 import sys
 from pathlib import Path
+
+
+def load_proper_nouns(csv_path: str = None) -> list:
+    """
+    從 CSV 檔案載入專有名詞清單。
+
+    CSV 格式：單行逗號分隔，例如：
+        NVIDIA,DeviceOn,WEDA,GenAI Studio,Oniverse
+
+    csv_path 優先順序：
+      1. 傳入的 csv_path 參數
+      2. 環境變數 PROPER_NOUNS_CSV
+      3. 腳本同目錄下的 Proper_Nouns.csv
+    """
+    candidates = []
+    if csv_path:
+        candidates.append(Path(csv_path))
+
+    env_path = os.environ.get("PROPER_NOUNS_CSV")
+    if env_path:
+        candidates.append(Path(env_path))
+
+    # 腳本同目錄 or 工作目錄
+    script_dir = Path(__file__).parent
+    candidates.append(script_dir / "Proper_Nouns.csv")
+    candidates.append(Path.cwd() / "Proper_Nouns.csv")
+
+    for path in candidates:
+        if path.exists():
+            with open(path, newline="", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                nouns = []
+                for row in reader:
+                    nouns.extend(term.strip() for term in row if term.strip())
+            print(f"載入專有名詞：{len(nouns)} 個（來源：{path}）")
+            return nouns
+
+    print("提示：未找到 Proper_Nouns.csv，跳過專有名詞注入。", file=sys.stderr)
+    return []
 
 
 def get_device(preferred: str = "auto") -> str:
@@ -287,10 +327,20 @@ def transcribe_with_diarization(
     # 11 GB VRAM 機器（如 RTX 2080 Ti）建議用 medium，large-v3 約需 6 GB
     model_name = "large-v3" if resolved_device != "cpu" else "medium"
     print(f"載入 Whisper 模型（{model_name}）...")
+
+    proper_nouns = load_proper_nouns()
+    noun_str = ", ".join(proper_nouns)
+
+    # initial_prompt 只保留語境句，避免 Whisper 將過長的 prompt 複誦進轉錄結果
+    asr_options = {"beam_size": 10, "initial_prompt": "以下是一段中文會議錄音的逐字稿。"}
+    if noun_str:
+        # hotwords 負責詞彙提示（需 faster-whisper >= 1.0.2）
+        asr_options["hotwords"] = noun_str
+
     model = whisperx.load_model(
         model_name, resolved_device, compute_type=compute_type,
         language=language if language != "auto" else None,
-        asr_options={"beam_size": 10, "initial_prompt": "以下是一段中文會議錄音的逐字稿："},
+        asr_options=asr_options,
     )
     result = model.transcribe(audio, batch_size=8)
     detected_language = result.get("language", language)
