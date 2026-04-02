@@ -480,13 +480,56 @@ paths:
                 total: 2
                 speakers:
                   - name: Alice
-                    source_file: alice_sample.wav
+                    source_file: Alice.wav
                     dim: 512
+                    has_audio: true
                   - name: Bob
-                    source_file: bob_sample.mp3
+                    source_file: Bob.mp3
                     dim: 512
+                    has_audio: true
         "401":
           $ref: "#/components/responses/Unauthorized"
+
+  # -------------------------------------------------------------------------
+  # GET /speakers/{name}/audio
+  # -------------------------------------------------------------------------
+  /speakers/{name}/audio:
+    get:
+      tags: [聲紋庫]
+      summary: 試聽 Speaker 聲紋音檔
+      description: |
+        串流播放指定 Speaker 註冊時上傳的聲紋音檔，供前端點擊試聽使用。
+
+        若該 Speaker 尚未保存音檔（舊版註冊）則回傳 404。
+      operationId: getSpeakerAudio
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Speaker 名稱
+          example: Alice
+      responses:
+        "200":
+          description: 音訊串流
+          content:
+            audio/wav:
+              schema:
+                type: string
+                format: binary
+            audio/mpeg:
+              schema:
+                type: string
+                format: binary
+            audio/mp4:
+              schema:
+                type: string
+                format: binary
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
 
   # -------------------------------------------------------------------------
   # DELETE /speakers/{name}
@@ -806,6 +849,7 @@ components:
         - name
         - source_file
         - dim
+        - has_audio
       properties:
         name:
           type: string
@@ -813,12 +857,16 @@ components:
           example: Alice
         source_file:
           type: string
-          description: 註冊時使用的音檔名稱
-          example: alice_sample.wav
+          description: 聲紋音檔的檔名（存放於 speaker_profiles/）
+          example: Alice.wav
         dim:
           type: integer
           description: Embedding 向量維度
           example: 512
+        has_audio:
+          type: boolean
+          description: 是否有可試聽的聲紋音檔（可呼叫 GET /speakers/{name}/audio）
+          example: true
 
     SpeakerListResponse:
       type: object

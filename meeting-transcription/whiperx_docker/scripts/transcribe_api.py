@@ -193,6 +193,7 @@ class SpeakerProfile(BaseModel):
     name: str = Field(description="Speaker 名稱", examples=["Alice"])
     source_file: str = Field(description="註冊時使用的音檔名稱", examples=["alice.wav"])
     dim: int = Field(description="Embedding 向量維度", examples=[512])
+    has_audio: bool = Field(default=False, description="是否有可試聽的聲紋音檔")
 
 
 class SpeakerListResponse(BaseModel):
@@ -742,10 +743,9 @@ async def enroll_speaker(
     if not hf_token:
         raise HTTPException(status_code=500, detail="HF_TOKEN 未設定，無法載入 pyannote/embedding 模型。")
 
-    # 儲存上傳音訊
+    # 儲存上傳音訊（暫存）
     enroll_path = UPLOAD_DIR / f"enroll_{name}{suffix}"
-    with open(enroll_path, "wb") as f:
-        content = await audio.read()
+    content = await audio.read()
     if not content:
         raise HTTPException(status_code=400, detail="上傳檔案為空。")
     enroll_path.write_bytes(content)
@@ -759,6 +759,17 @@ async def enroll_speaker(
             except ImportError:
                 resolved_device = "cpu"
 
+        # 若重新註冊，先刪除舊的音檔（避免殘留不同副檔名的舊檔）
+        old_profile_path = SPEAKER_DIR / f"{name}.json"
+        if old_profile_path.exists():
+            try:
+                old_data = json.loads(old_profile_path.read_text(encoding="utf-8"))
+                old_audio = old_data.get("source_file", "")
+                if old_audio:
+                    (SPEAKER_DIR / old_audio).unlink(missing_ok=True)
+            except Exception:
+                pass
+
         from speaker_db import enroll_speaker as _enroll
         _enroll(
             name=name,
@@ -767,6 +778,19 @@ async def enroll_speaker(
             hf_token=hf_token,
             device=resolved_device,
         )
+
+        # 將音檔移至聲紋庫目錄以供試聽（覆蓋舊檔）
+        audio_dest = SPEAKER_DIR / f"{name}{suffix}"
+        shutil.move(str(enroll_path), str(audio_dest))
+
+        # 更新 JSON profile 的 source_file 為實際存放的檔名
+        profile_path = SPEAKER_DIR / f"{name}.json"
+        profile_data = json.loads(profile_path.read_text(encoding="utf-8"))
+        profile_data["source_file"] = audio_dest.name
+        profile_path.write_text(json.dumps(profile_data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"聲紋提取失敗：{e}")
     finally:
@@ -797,6 +821,49 @@ def list_speakers():
     from speaker_db import list_speaker_profiles
     speakers = list_speaker_profiles(SPEAKER_DIR)
     return SpeakerListResponse(total=len(speakers), speakers=speakers)
+
+
+_AUDIO_MEDIA_TYPES = {
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".m4a": "audio/mp4",
+    ".ogg": "audio/ogg",
+    ".flac": "audio/flac",
+    ".webm": "audio/webm",
+    ".aac": "audio/aac",
+    ".mp4": "audio/mp4",
+}
+
+
+@app.get(
+    "/speakers/{name}/audio",
+    tags=["聲紋庫"],
+    summary="試聽 Speaker 聲紋音檔",
+    description="串流播放指定 Speaker 註冊時上傳的聲紋音檔，供前端試聽使用。",
+    responses={
+        200: {"description": "音訊串流", "content": {"audio/*": {}}},
+        401: {"description": "API Key 錯誤", "model": ErrorResponse},
+        404: {"description": "找不到 Speaker 或無音檔", "model": ErrorResponse},
+    },
+    dependencies=[Depends(verify_api_key)],
+)
+def get_speaker_audio(name: str):
+    profile_path = SPEAKER_DIR / f"{name}.json"
+    if not profile_path.exists():
+        raise HTTPException(status_code=404, detail=f"找不到 Speaker：{name}")
+
+    try:
+        data = json.loads(profile_path.read_text(encoding="utf-8"))
+    except Exception:
+        raise HTTPException(status_code=500, detail="讀取聲紋資料失敗。")
+
+    source_file = data.get("source_file", "")
+    audio_path = SPEAKER_DIR / source_file if source_file else None
+    if not source_file or not audio_path.exists():
+        raise HTTPException(status_code=404, detail=f"Speaker {name} 沒有可試聽的音檔。")
+
+    media_type = _AUDIO_MEDIA_TYPES.get(audio_path.suffix.lower(), "application/octet-stream")
+    return FileResponse(path=audio_path, media_type=media_type, filename=source_file)
 
 
 @app.delete(

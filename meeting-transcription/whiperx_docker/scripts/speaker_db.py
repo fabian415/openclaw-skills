@@ -135,9 +135,16 @@ def enroll_speaker(
 
 
 def delete_speaker(name: str, speaker_dir: Path) -> bool:
-    """刪除 Speaker 聲紋檔。成功返回 True，找不到返回 False。"""
+    """刪除 Speaker 聲紋檔及對應音檔。成功返回 True，找不到返回 False。"""
     profile_path = speaker_dir / f"{name}.json"
     if profile_path.exists():
+        try:
+            data = json.loads(profile_path.read_text(encoding="utf-8"))
+            source_file = data.get("source_file", "")
+            if source_file:
+                (speaker_dir / source_file).unlink(missing_ok=True)
+        except Exception:
+            pass
         profile_path.unlink()
         return True
     return False
@@ -170,10 +177,13 @@ def list_speaker_profiles(speaker_dir: Path) -> list:
     for f in speaker_dir.glob("*.json"):
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
+            source_file = data.get("source_file", "")
+            has_audio = bool(source_file) and (speaker_dir / source_file).exists()
             speakers.append({
                 "name": data["name"],
-                "source_file": data.get("source_file", ""),
+                "source_file": source_file,
                 "dim": data.get("dim", 0),
+                "has_audio": has_audio,
             })
         except Exception:
             pass
