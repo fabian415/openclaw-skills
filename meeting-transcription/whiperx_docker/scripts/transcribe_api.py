@@ -41,6 +41,7 @@ from pydantic import BaseModel, Field
 UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", "/app/uploads"))
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/app/outputs"))
 SPEAKER_DIR = Path(os.environ.get("SPEAKER_DIR", "/app/speaker_profiles"))
+PROPER_NOUNS_CSV = Path(os.environ.get("PROPER_NOUNS_CSV", "/app/Proper_Nouns.csv"))
 MAX_FILE_MB = int(os.environ.get("MAX_FILE_MB", "500"))
 JOB_TTL_HOURS = int(os.environ.get("JOB_TTL_HOURS", "48"))
 API_KEY = os.environ.get("API_KEY", "")
@@ -59,6 +60,7 @@ JOBS_DIR = OUTPUT_DIR / "_jobs"
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
 _jobs_lock = threading.Lock()
+_nouns_lock = threading.Lock()
 
 
 class JobStatus(str, Enum):
@@ -208,6 +210,25 @@ class EnrollResponse(BaseModel):
 
     name: str = Field(description="已註冊的 Speaker 名稱", examples=["Alice"])
     message: str = Field(description="說明訊息", examples=["Speaker Alice 註冊成功。"])
+
+
+class NounListResponse(BaseModel):
+    """GET /proper-nouns 的回應"""
+
+    total: int = Field(description="專有名詞總數", examples=[10])
+    terms: List[str] = Field(description="專有名詞清單（依原始順序）", examples=[["Rison", "NVIDIA", "GPU"]])
+
+
+class NounAddRequest(BaseModel):
+    """POST /proper-nouns 的請求體"""
+
+    term: str = Field(description="要新增的專有名詞", examples=["WhisperX"])
+
+
+class NounUpdateRequest(BaseModel):
+    """PUT /proper-nouns/{term} 的請求體"""
+
+    new_term: str = Field(description="修改後的專有名詞", examples=["WhisperX_v3"])
 
 
 # ---------------------------------------------------------------------------
@@ -404,6 +425,7 @@ GET /jobs/{job_id}/result  → 下載 Markdown
         {"name": "轉錄", "description": "提交音訊並管理轉錄任務"},
         {"name": "工作管理", "description": "查詢、列出、刪除工作"},
         {"name": "聲紋庫", "description": "Speaker 聲紋註冊與管理"},
+        {"name": "專有名詞", "description": "管理 ASR 熱詞清單（提升辨識準確率）"},
         {"name": "系統", "description": "健康檢查與服務狀態"},
     ],
     lifespan=lifespan,
@@ -884,6 +906,128 @@ def delete_speaker(name: str):
     if not _delete(name, SPEAKER_DIR):
         raise HTTPException(status_code=404, detail=f"找不到 Speaker：{name}")
     return DeleteResponse(message=f"Speaker {name} 已從聲紋庫刪除。")
+
+
+# ---------------------------------------------------------------------------
+# 專有名詞（Proper Nouns）工具函式
+# ---------------------------------------------------------------------------
+
+def _load_nouns() -> List[str]:
+    """從 CSV 讀取專有名詞清單。"""
+    if not PROPER_NOUNS_CSV.exists():
+        return []
+    with _nouns_lock:
+        text = PROPER_NOUNS_CSV.read_text(encoding="utf-8").strip()
+    if not text:
+        return []
+    return [t.strip() for t in text.split(",") if t.strip()]
+
+
+def _save_nouns(terms: List[str]):
+    """將專有名詞清單寫回 CSV。"""
+    with _nouns_lock:
+        PROPER_NOUNS_CSV.write_text(", ".join(terms), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# 專有名詞 Routes
+# ---------------------------------------------------------------------------
+
+@app.get(
+    "/proper-nouns",
+    tags=["專有名詞"],
+    summary="列出所有專有名詞",
+    description="回傳目前 ASR 熱詞清單中的所有專有名詞，依原始 CSV 順序排列。",
+    response_model=NounListResponse,
+    responses={
+        200: {"description": "專有名詞清單", "model": NounListResponse},
+        401: {"description": "API Key 錯誤", "model": ErrorResponse},
+    },
+    dependencies=[Depends(verify_api_key)],
+)
+def list_proper_nouns():
+    terms = _load_nouns()
+    return NounListResponse(total=len(terms), terms=terms)
+
+
+@app.post(
+    "/proper-nouns",
+    tags=["專有名詞"],
+    summary="新增專有名詞",
+    description="將一個新詞加入 ASR 熱詞清單末尾。若該詞已存在，回傳 409。",
+    response_model=NounListResponse,
+    status_code=201,
+    responses={
+        201: {"description": "新增成功，回傳更新後的完整清單", "model": NounListResponse},
+        401: {"description": "API Key 錯誤", "model": ErrorResponse},
+        409: {"description": "專有名詞已存在", "model": ErrorResponse},
+    },
+    dependencies=[Depends(verify_api_key)],
+)
+def add_proper_noun(body: NounAddRequest):
+    term = body.term.strip()
+    if not term:
+        raise HTTPException(status_code=422, detail="term 不可為空字串。")
+    terms = _load_nouns()
+    if term in terms:
+        raise HTTPException(status_code=409, detail=f"專有名詞「{term}」已存在。")
+    terms.append(term)
+    _save_nouns(terms)
+    return JSONResponse(
+        status_code=201,
+        content=NounListResponse(total=len(terms), terms=terms).model_dump(),
+    )
+
+
+@app.put(
+    "/proper-nouns/{term}",
+    tags=["專有名詞"],
+    summary="修改專有名詞",
+    description="將清單中的指定詞修改為新的名稱，保留原始位置。若原詞不存在回傳 404；若新詞已存在回傳 409。",
+    response_model=NounListResponse,
+    responses={
+        200: {"description": "修改成功，回傳更新後的完整清單", "model": NounListResponse},
+        401: {"description": "API Key 錯誤", "model": ErrorResponse},
+        404: {"description": "找不到指定的專有名詞", "model": ErrorResponse},
+        409: {"description": "新名稱已存在於清單中", "model": ErrorResponse},
+    },
+    dependencies=[Depends(verify_api_key)],
+)
+def update_proper_noun(term: str, body: NounUpdateRequest):
+    new_term = body.new_term.strip()
+    if not new_term:
+        raise HTTPException(status_code=422, detail="new_term 不可為空字串。")
+    terms = _load_nouns()
+    if term not in terms:
+        raise HTTPException(status_code=404, detail=f"找不到專有名詞「{term}」。")
+    if new_term != term and new_term in terms:
+        raise HTTPException(status_code=409, detail=f"專有名詞「{new_term}」已存在。")
+    idx = terms.index(term)
+    terms[idx] = new_term
+    _save_nouns(terms)
+    return NounListResponse(total=len(terms), terms=terms)
+
+
+@app.delete(
+    "/proper-nouns/{term}",
+    tags=["專有名詞"],
+    summary="刪除專有名詞",
+    description="從 ASR 熱詞清單中移除指定的專有名詞。若不存在回傳 404。",
+    response_model=NounListResponse,
+    responses={
+        200: {"description": "刪除成功，回傳更新後的完整清單", "model": NounListResponse},
+        401: {"description": "API Key 錯誤", "model": ErrorResponse},
+        404: {"description": "找不到指定的專有名詞", "model": ErrorResponse},
+    },
+    dependencies=[Depends(verify_api_key)],
+)
+def delete_proper_noun(term: str):
+    terms = _load_nouns()
+    if term not in terms:
+        raise HTTPException(status_code=404, detail=f"找不到專有名詞「{term}」。")
+    terms.remove(term)
+    _save_nouns(terms)
+    return NounListResponse(total=len(terms), terms=terms)
 
 
 # ---------------------------------------------------------------------------

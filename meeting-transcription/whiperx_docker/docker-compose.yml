@@ -25,8 +25,8 @@ services:
       - hf_cache:/root/.cache/huggingface
       # ModelScope 模型快取（FunASR CT-Punc，~1 GB）
       - modelscope_cache:/root/.cache/modelscope
-      # 專有名詞清單：更新 CSV 後無需重新 build image
-      - ./Proper_Nouns.csv:/app/Proper_Nouns.csv:ro
+      # 專有名詞清單：更新 CSV 後無需重新 build image（可寫入，供 API 管理）
+      - ./Proper_Nouns.csv:/app/Proper_Nouns.csv
 
     # NVIDIA GPU 支援（需安裝 nvidia-container-toolkit）
     deploy:
