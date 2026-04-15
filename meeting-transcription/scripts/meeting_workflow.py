@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
 Meeting Transcription Workflow
-支援兩種轉錄模式：
-  --mode gemini  使用 Google Gemini API（預設）
-  --mode local   使用本地 Whisper 伺服器
+支援三種轉錄模式：
+  --mode gemini   使用 Google Gemini API（預設）
+  --mode local    使用本地 Whisper 伺服器
+  --mode openai   使用 Azure OpenAI gpt-4o-transcribe
 
 Usage:
-  python3 meeting_workflow.py <audio_file> [--mode gemini|local] [--emails addr ...]
+  python3 meeting_workflow.py <audio_file> [--mode gemini|local|openai] [--emails addr ...]
 
 .env 環境變數：
   GEMINI_API_KEY, SMTP_USER, SMTP_PASS, EMAIL_RECIPIENTS
   LOCAL_SERVER_IP, LOCAL_SERVER_PORT, LOCAL_API_KEY
+  AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_DEPLOYMENT_NAME,
+  AZURE_OPENAI_API_VERSION, AZURE_OPENAI_API_KEY
 """
 
 import os
@@ -33,6 +36,8 @@ load_dotenv(Path.home() / ".openclaw/workspace/.env")
 
 import requests
 import markdown as md_lib
+import json
+from datetime import datetime
 
 
 # ──────────────────────────────────────────────────────────
@@ -49,6 +54,41 @@ def check_env(*keys):
 def _guess_mime(path: Path) -> str:
     mime, _ = mimetypes.guess_type(str(path))
     return mime or "audio/mpeg"
+
+
+def _extract_meeting_date(base_name: str) -> str:
+    m = re.search(r"(\d{4}-\d{2}-\d{2})", base_name)
+    if m:
+        return m.group(1)
+    m = re.search(r"(\d{8})", base_name)
+    if m:
+        raw = m.group(1)
+        return f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}"
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _clean_meeting_name(base_name: str, meeting_date: str) -> str:
+    name = base_name
+    name = name.replace(meeting_date, "")
+    name = re.sub(r"^[\W_]+|[\W_]+$", "", name)
+    name = re.sub(r"[_\-]+", "_", name)
+    return name or "未命名會議"
+
+
+def _archive_paths(base_name: str) -> dict:
+    meeting_date = _extract_meeting_date(base_name)
+    meeting_name = _clean_meeting_name(base_name, meeting_date)
+    archive_dir = _workspace / "meeting-archives"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    transcript_txt = archive_dir / f"{meeting_date}_{meeting_name}_逐字稿.txt"
+    notes_txt = archive_dir / f"{meeting_date}_{meeting_name}_會議內容.txt"
+    return {
+        "date": meeting_date,
+        "meeting_name": meeting_name,
+        "archive_dir": archive_dir,
+        "transcript_txt": transcript_txt,
+        "notes_txt": notes_txt,
+    }
 
 
 # ──────────────────────────────────────────────────────────
@@ -103,6 +143,95 @@ def transcribe_gemini(audio_path: Path, model: str) -> str:
 
 
 # ──────────────────────────────────────────────────────────
+# Mode C: Azure OpenAI 轉錄（gpt-4o-transcribe）
+# ──────────────────────────────────────────────────────────
+
+def transcribe_azure_openai(audio_path: Path) -> str:
+    check_env(
+        "AZURE_OPENAI_ENDPOINT",
+        "AZURE_OPENAI_DEPLOYMENT_NAME",
+        "AZURE_OPENAI_API_VERSION",
+        "AZURE_OPENAI_API_KEY",
+    )
+
+    endpoint   = os.environ["AZURE_OPENAI_ENDPOINT"].rstrip("/")
+    deployment = os.environ["AZURE_OPENAI_DEPLOYMENT_NAME"]
+    api_ver    = os.environ["AZURE_OPENAI_API_VERSION"]
+    api_key    = os.environ["AZURE_OPENAI_API_KEY"]
+
+    url = (
+        f"{endpoint}/openai/deployments/{deployment}"
+        f"/audio/transcriptions?api-version={api_ver}"
+    )
+    headers = {"api-key": api_key}
+
+    # 檔案大小檢查（Azure OpenAI 限制 25 MB）
+    file_size_mb = audio_path.stat().st_size / (1024 * 1024)
+    if file_size_mb > 25:
+        print(f"[警告] 音檔大小 {file_size_mb:.1f} MB 超過 Azure OpenAI 25 MB 限制，可能失敗")
+
+    print(f"[1/5] [Azure OpenAI] 上傳音檔進行轉錄: {audio_path.name} ...")
+    print(f"  端點: {endpoint} | 模型: {deployment} | 檔案: {file_size_mb:.1f} MB")
+
+    # gpt-4o-transcribe-diarize 需要 chunking_strategy，且只支援 json/text response_format
+    with open(audio_path, "rb") as f:
+        resp = requests.post(
+            url,
+            headers=headers,
+            files={"file": (audio_path.name, f, _guess_mime(audio_path))},
+            data={"response_format": "json", "chunking_strategy": "auto"},
+            timeout=600,
+        )
+
+    if resp.status_code != 200:
+        print(f"[錯誤] Azure OpenAI API 回應 {resp.status_code}: {resp.text[:500]}")
+        sys.exit(1)
+
+    print("[✓] 轉錄完成，解析結果...")
+
+    result = resp.json()
+
+    # 嘗試從 segments 中取說話者資訊（若 API 未來支援）
+    segments = result.get("segments", [])
+    if segments:
+        speaker_map: dict = {}
+        speaker_counter = 0
+
+        def _resolve_speaker(raw: str) -> str:
+            nonlocal speaker_counter
+            if not raw:
+                return "Speaker 1"
+            if raw not in speaker_map:
+                speaker_counter += 1
+                speaker_map[raw] = f"Speaker {speaker_counter}"
+            return speaker_map[raw]
+
+        lines = []
+        for seg in segments:
+            start = float(seg.get("start", 0))
+            h = int(start // 3600)
+            m = int((start % 3600) // 60)
+            s = int(start % 60)
+            text = seg.get("text", "").strip()
+            raw_speaker = seg.get("speaker", "")
+            speaker = _resolve_speaker(raw_speaker)
+            if text:
+                lines.append(f"[{h:02d}:{m:02d}:{s:02d}] {speaker}: {text}")
+
+        if speaker_map:
+            print(f"[✓] 辨識到 {len(speaker_map)} 位說話者: {', '.join(speaker_map.values())}")
+        return "\n".join(lines)
+
+    # 目前 /audio/transcriptions 端點僅回傳純文字，無時間戳與說話者標籤
+    full_text = result.get("text", "").strip()
+    if not full_text:
+        print("[錯誤] Azure OpenAI 未回傳任何文字")
+        sys.exit(1)
+    print("[ℹ️] 此端點回傳純文字（無時間戳／說話者標籤），後續由 Agent 生成會議記錄")
+    return full_text
+
+
+# ──────────────────────────────────────────────────────────
 # Mode B: 本地伺服器轉錄
 # ──────────────────────────────────────────────────────────
 
@@ -132,7 +261,7 @@ def transcribe_local(audio_path: Path, num_speakers: int = None) -> str:
 
     # Step 2: 輪詢狀態（每 15 秒）
     print("[2/5] [本地] 等待轉錄完成（每 15 秒查詢一次）...")
-    for attempt in range(120):  # 最多等 30 分鐘
+    for attempt in range(480):  # 最多等 120 分鐘
         time.sleep(15)
         r = requests.get(f"{base_url}/jobs/{job_id}", headers=headers, timeout=30)
         r.raise_for_status()
@@ -436,8 +565,8 @@ def send_email(recipients: list, subject: str, html_body: str, attachment_path: 
 def main():
     parser = argparse.ArgumentParser(description="Meeting transcription + minutes workflow")
     parser.add_argument("audio", help="錄音檔路徑")
-    parser.add_argument("--mode", choices=["gemini", "local"], default="gemini",
-                        help="轉錄模式：gemini（預設）或 local（本地伺服器）")
+    parser.add_argument("--mode", choices=["gemini", "local", "openai"], default="gemini",
+                        help="轉錄模式：gemini（預設）/ local（本地伺服器）/ openai（Azure OpenAI）")
     parser.add_argument("--step", choices=["all", "transcribe", "email"], default="all",
                         help="執行步驟：all=完整流程 / transcribe=僅轉錄 / email=僅寄信（讀現有檔案）")
     parser.add_argument("--emails", nargs="+", metavar="EMAIL",
@@ -472,6 +601,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     transcript_path = out_dir / f"{base_name}_逐字稿.md"
     meta_path = out_dir / f"{base_name}_meta.json"
+    archive_info = _archive_paths(base_name)
 
     # ── 讀取或設定預設 meta（供 email step 使用）─────────────
     def load_meta() -> dict:
@@ -494,10 +624,15 @@ def main():
         if args.mode == "gemini":
             check_env("GEMINI_API_KEY")
             transcript = transcribe_gemini(audio_path, args.model)
+        elif args.mode == "openai":
+            transcript = transcribe_azure_openai(audio_path)
         else:
             transcript = transcribe_local(audio_path, args.num_speakers)
+
         transcript_path.write_text(transcript, encoding="utf-8")
+        archive_info["transcript_txt"].write_text(transcript, encoding="utf-8")
         print(f"[✓] 逐字稿已存: {transcript_path}")
+        print(f"[✓] 逐字稿固定歸檔: {archive_info['transcript_txt']}")
 
     # ── Step: classify + generate notes（僅 gemini all 模式）─
     if args.step == "all" and args.mode == "gemini":
@@ -510,12 +645,17 @@ def main():
         notes_path = out_dir / notes_filename
         notes_full = f"# {base_name} {category['label']}\n\n" + notes
         notes_path.write_text(notes_full, encoding="utf-8")
+        archive_info["notes_txt"].write_text(notes_full, encoding="utf-8")
         print(f"[✓] {category['label']}已存: {notes_path}")
+        print(f"[✓] 會議內容固定歸檔: {archive_info['notes_txt']}")
 
-    # ── Step: transcribe only（本地模式）→ 結束，交由 Agent 分類並生成筆記 ──
+    # ── Step: transcribe only（本地／openai 模式）→ 結束，交由 Agent 分類並生成筆記 ──
     if args.step == "transcribe":
-        print(f"\n✅ 轉錄完成！請 Agent 讀取逐字稿、分類後生成對應筆記：\n   {transcript_path}")
+        print(f"\n✅ 轉錄完成！請 Agent 讀取逐字稿、分類後生成對應筆記：")
+        print(f"   逐字稿路徑：{transcript_path}")
+        print(f"   固定歸檔：{archive_info['transcript_txt']}")
         print(f"   完成後執行寄信：python3 {__file__} {audio_path} --step email")
+        print("   並詢問使用者是否要透過 project-insight-synthesizer 持續更新專案進度文件。")
         return
 
     # ── Step: email ───────────────────────────────────────
@@ -535,12 +675,25 @@ def main():
                 print("請先生成筆記再執行寄信步驟。")
                 sys.exit(1)
         notes_full = notes_path.read_text(encoding="utf-8")
+        archive_info["notes_txt"].write_text(notes_full, encoding="utf-8")
+        print(f"[✓] 會議內容固定歸檔: {archive_info['notes_txt']}")
         print(f"[*] 轉換 {label} 為 HTML ...")
         html_body = minutes_to_html(notes_full, base_name)
         subject = f"【{label}】{base_name}"
         send_email(recipients, subject, html_body, transcript_path)
 
+    summary = {
+        "meeting_date": archive_info["date"],
+        "meeting_name": archive_info["meeting_name"],
+        "transcript_archive": str(archive_info["transcript_txt"]),
+        "notes_archive": str(archive_info["notes_txt"]),
+        "ask_project_insight": True,
+    }
     print(f"\n✅ 完成！輸出位於: {out_dir}")
+    print(f"✅ 固定歸檔位置: {archive_info['archive_dir']}")
+    print("✅ 後續請詢問使用者：是否要透過 project-insight-synthesizer 持續更新專案進度文件？")
+    print("✅ 注意：必須等使用者明確回覆同意後，才可繼續執行；不可自動串接。")
+    print("[SUMMARY]" + json.dumps(summary, ensure_ascii=False))
 
 
 if __name__ == "__main__":
