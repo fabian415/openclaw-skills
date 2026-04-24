@@ -15,22 +15,24 @@ transcribe_api.py - WhisperX 語音轉錄 + 語者分離 API 服務
     OUTPUT_DIR      輸出根目錄（預設：/app/outputs）
     MAX_FILE_MB     單檔上傳限制（預設：500 MB）
     JOB_TTL_HOURS   工作保留時間（預設：48 小時）
+    JOB_TIMEOUT_SECONDS 超時秒數（預設：6 小時）
 """
 
 import json
 import os
 import re
 import shutil
+import sqlite3
 import sys
 import threading
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -45,6 +47,7 @@ SPEAKER_DIR = Path(os.environ.get("SPEAKER_DIR", "/app/speaker_profiles"))
 PROPER_NOUNS_CSV = Path(os.environ.get("PROPER_NOUNS_CSV", "/app/Proper_Nouns.csv"))
 MAX_FILE_MB = int(os.environ.get("MAX_FILE_MB", "500"))
 JOB_TTL_HOURS = int(os.environ.get("JOB_TTL_HOURS", "48"))
+JOB_TIMEOUT_SECONDS = int(os.environ.get("JOB_TIMEOUT_SECONDS", str(6 * 60 * 60)))
 API_KEY = os.environ.get("API_KEY", "")
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -59,8 +62,12 @@ ALLOWED_EXTENSIONS = {".mp3", ".mp4", ".wav", ".m4a", ".ogg", ".flac", ".webm", 
 
 JOBS_DIR = OUTPUT_DIR / "_jobs"
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
+JOBS_DB = Path(os.environ.get("JOBS_DB", str(JOBS_DIR / "jobs.sqlite3")))
 
 _jobs_lock = threading.Lock()
+_queue_cv = threading.Condition()
+_worker_stop = threading.Event()
+_worker_thread: Optional[threading.Thread] = None
 _nouns_lock = threading.Lock()
 NOUN_TERM_PATTERN = re.compile(r"^[\w .-]+$")
 MAX_PROPER_NOUNS = int(os.environ.get("MAX_PROPER_NOUNS", "48"))
@@ -242,32 +249,278 @@ def _job_file(job_id: str) -> Path:
     return JOBS_DIR / f"{job_id}.json"
 
 
+@contextmanager
+def _db_connect():
+    conn = sqlite3.connect(JOBS_DB, timeout=30, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def init_jobs_db():
+    JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    with _jobs_lock, _db_connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS jobs (
+                job_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                started_at TEXT,
+                audio_filename TEXT NOT NULL,
+                audio_path TEXT,
+                language TEXT NOT NULL,
+                device TEXT NOT NULL,
+                num_speakers INTEGER,
+                add_punctuation INTEGER NOT NULL,
+                duration_seconds REAL,
+                num_speakers_detected INTEGER,
+                output_path TEXT,
+                error TEXT
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs(status, created_at)")
+
+
+def _row_to_job(row: sqlite3.Row) -> JobRecord:
+    return JobRecord(
+        job_id=row["job_id"],
+        status=JobStatus(row["status"]),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        audio_filename=row["audio_filename"],
+        language=row["language"],
+        device=row["device"],
+        num_speakers=row["num_speakers"],
+        add_punctuation=bool(row["add_punctuation"]),
+        duration_seconds=row["duration_seconds"],
+        num_speakers_detected=row["num_speakers_detected"],
+        output_path=row["output_path"],
+        error=row["error"],
+    )
+
+
+def _record_values(record: JobRecord, audio_path: Optional[Path] = None) -> dict:
+    return {
+        "job_id": record.job_id,
+        "status": record.status.value,
+        "created_at": record.created_at,
+        "updated_at": record.updated_at,
+        "audio_filename": record.audio_filename,
+        "audio_path": str(audio_path) if audio_path else None,
+        "language": record.language,
+        "device": record.device,
+        "num_speakers": record.num_speakers,
+        "add_punctuation": 1 if record.add_punctuation else 0,
+        "duration_seconds": record.duration_seconds,
+        "num_speakers_detected": record.num_speakers_detected,
+        "output_path": record.output_path,
+        "error": record.error,
+    }
+
+
+def enqueue_job(record: JobRecord, audio_path: Path):
+    with _jobs_lock, _db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO jobs (
+                job_id, status, created_at, updated_at, audio_filename, audio_path,
+                language, device, num_speakers, add_punctuation, duration_seconds,
+                num_speakers_detected, output_path, error
+            )
+            VALUES (
+                :job_id, :status, :created_at, :updated_at, :audio_filename, :audio_path,
+                :language, :device, :num_speakers, :add_punctuation, :duration_seconds,
+                :num_speakers_detected, :output_path, :error
+            )
+            """,
+            _record_values(record, audio_path),
+        )
+    with _queue_cv:
+        _queue_cv.notify()
+
+
 def save_job(record: JobRecord):
-    with _jobs_lock:
-        _job_file(record.job_id).write_text(
-            record.model_dump_json(indent=2), encoding="utf-8"
+    values = _record_values(record)
+    values["started_at"] = _now_iso() if record.status == JobStatus.RUNNING else None
+    with _jobs_lock, _db_connect() as conn:
+        conn.execute(
+            """
+            UPDATE jobs
+            SET status = :status,
+                updated_at = :updated_at,
+                started_at = COALESCE(started_at, :started_at),
+                audio_filename = :audio_filename,
+                language = :language,
+                device = :device,
+                num_speakers = :num_speakers,
+                add_punctuation = :add_punctuation,
+                duration_seconds = :duration_seconds,
+                num_speakers_detected = :num_speakers_detected,
+                output_path = :output_path,
+                error = :error
+            WHERE job_id = :job_id
+            """,
+            values,
         )
 
 
 def load_job(job_id: str) -> Optional[JobRecord]:
-    p = _job_file(job_id)
-    if not p.exists():
-        return None
-    with _jobs_lock:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    return JobRecord(**data)
+    with _jobs_lock, _db_connect() as conn:
+        row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+    return _row_to_job(row) if row else None
 
 
 def list_jobs() -> List[JobRecord]:
-    records = []
-    with _jobs_lock:
-        for f in JOBS_DIR.glob("*.json"):
-            try:
-                data = json.loads(f.read_text(encoding="utf-8"))
-                records.append(JobRecord(**data))
-            except Exception:
-                pass
-    return sorted(records, key=lambda r: r.created_at, reverse=True)
+    with _jobs_lock, _db_connect() as conn:
+        rows = conn.execute("SELECT * FROM jobs ORDER BY created_at DESC").fetchall()
+    return [_row_to_job(row) for row in rows]
+
+
+def delete_job_record(job_id: str):
+    with _jobs_lock, _db_connect() as conn:
+        conn.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
+
+
+def _mark_stale_running_failed(conn: sqlite3.Connection, now: str):
+    timeout_cutoff = (datetime.utcnow() - timedelta(seconds=JOB_TIMEOUT_SECONDS)).isoformat() + "Z"
+    conn.execute(
+        """
+        UPDATE jobs
+        SET status = ?, updated_at = ?, error = ?
+        WHERE status = ? AND started_at IS NOT NULL AND started_at < ?
+        """,
+        (
+            JobStatus.FAILED.value,
+            now,
+            f"Job exceeded timeout of {JOB_TIMEOUT_SECONDS} seconds.",
+            JobStatus.RUNNING.value,
+            timeout_cutoff,
+        ),
+    )
+
+
+def _claim_next_job() -> Optional[tuple[JobRecord, Path]]:
+    now = _now_iso()
+    with _jobs_lock, _db_connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            _mark_stale_running_failed(conn, now)
+            running_count = conn.execute(
+                "SELECT COUNT(*) FROM jobs WHERE status = ?",
+                (JobStatus.RUNNING.value,),
+            ).fetchone()[0]
+            if running_count:
+                conn.execute("COMMIT")
+                return None
+
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE status = ? ORDER BY created_at LIMIT 1",
+                (JobStatus.PENDING.value,),
+            ).fetchone()
+            if not row:
+                conn.execute("COMMIT")
+                return None
+            if not row["audio_path"]:
+                conn.execute(
+                    "UPDATE jobs SET status = ?, updated_at = ?, error = ? WHERE job_id = ?",
+                    (
+                        JobStatus.FAILED.value,
+                        now,
+                        "Queued audio path is missing; this legacy job cannot be resumed.",
+                        row["job_id"],
+                    ),
+                )
+                conn.execute("COMMIT")
+                return None
+
+            conn.execute(
+                "UPDATE jobs SET status = ?, updated_at = ?, started_at = ?, error = NULL WHERE job_id = ?",
+                (JobStatus.RUNNING.value, now, now, row["job_id"]),
+            )
+            row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (row["job_id"],)).fetchone()
+            conn.execute("COMMIT")
+            return _row_to_job(row), Path(row["audio_path"])
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+
+def _migrate_json_jobs():
+    for f in JOBS_DIR.glob("*.json"):
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            record = JobRecord(**data)
+            with _jobs_lock, _db_connect() as conn:
+                exists = conn.execute("SELECT 1 FROM jobs WHERE job_id = ?", (record.job_id,)).fetchone()
+                if exists:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO jobs (
+                        job_id, status, created_at, updated_at, audio_filename, audio_path,
+                        language, device, num_speakers, add_punctuation, duration_seconds,
+                        num_speakers_detected, output_path, error
+                    )
+                    VALUES (
+                        :job_id, :status, :created_at, :updated_at, :audio_filename, :audio_path,
+                        :language, :device, :num_speakers, :add_punctuation, :duration_seconds,
+                        :num_speakers_detected, :output_path, :error
+                    )
+                    """,
+                    _record_values(record),
+                )
+        except Exception:
+            pass
+
+
+def _recover_interrupted_jobs():
+    now = _now_iso()
+    with _jobs_lock, _db_connect() as conn:
+        conn.execute(
+            """
+            UPDATE jobs
+            SET status = ?, updated_at = ?, started_at = NULL, error = NULL
+            WHERE status = ?
+            """,
+            (JobStatus.PENDING.value, now, JobStatus.RUNNING.value),
+        )
+
+
+def _job_worker_loop():
+    while not _worker_stop.is_set():
+        claimed = _claim_next_job()
+        if claimed:
+            record, audio_path = claimed
+            _run_transcription(record.job_id, audio_path, record)
+            with _queue_cv:
+                _queue_cv.notify_all()
+            continue
+        with _queue_cv:
+            _queue_cv.wait(timeout=5)
+
+
+def start_job_worker():
+    global _worker_thread
+    if _worker_thread and _worker_thread.is_alive():
+        return
+    _worker_stop.clear()
+    _worker_thread = threading.Thread(target=_job_worker_loop, name="transcription-queue-worker", daemon=True)
+    _worker_thread.start()
+
+
+def stop_job_worker():
+    _worker_stop.set()
+    with _queue_cv:
+        _queue_cv.notify_all()
+    if _worker_thread and _worker_thread.is_alive():
+        _worker_thread.join(timeout=10)
 
 
 def _now_iso() -> str:
@@ -335,6 +588,7 @@ def _run_transcription(job_id: str, audio_path: Path, record: JobRecord):
                 stderr=subprocess.STDOUT,
                 text=True,
                 env=os.environ.copy(),
+                timeout=JOB_TIMEOUT_SECONDS,
             )
 
         print(f"[{job_id}] subprocess 結束，returncode={proc.returncode}", flush=True)
@@ -354,6 +608,11 @@ def _run_transcription(job_id: str, audio_path: Path, record: JobRecord):
         record.output_path = str(transcript_path)
         record.duration_seconds = duration_seconds
         record.num_speakers_detected = num_speakers_detected
+        record.updated_at = _now_iso()
+
+    except subprocess.TimeoutExpired:
+        record.status = JobStatus.FAILED
+        record.error = f"Job exceeded timeout of {JOB_TIMEOUT_SECONDS} seconds."
         record.updated_at = _now_iso()
 
     except Exception as e:
@@ -376,6 +635,9 @@ def _run_transcription(job_id: str, audio_path: Path, record: JobRecord):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """啟動時清理過期工作"""
+    init_jobs_db()
+    _migrate_json_jobs()
+    _recover_interrupted_jobs()
     cutoff = datetime.utcnow() - timedelta(hours=JOB_TTL_HOURS)
     for record in list_jobs():
         try:
@@ -384,10 +646,14 @@ async def lifespan(app: FastAPI):
                 out_dir = OUTPUT_DIR / record.job_id
                 if out_dir.exists():
                     shutil.rmtree(out_dir, ignore_errors=True)
-                _job_file(record.job_id).unlink(missing_ok=True)
+                delete_job_record(record.job_id)
         except Exception:
             pass
-    yield
+    start_job_worker()
+    try:
+        yield
+    finally:
+        stop_job_worker()
 
 
 ALLOWED_ENROLL_EXTENSIONS = {".mp3", ".mp4", ".wav", ".m4a", ".ogg", ".flac", ".webm", ".aac"}
@@ -494,7 +760,6 @@ def health():
     dependencies=[Depends(verify_api_key)],
 )
 async def transcribe(
-    background_tasks: BackgroundTasks,
     audio: UploadFile = File(
         ...,
         description="音訊檔（mp3 / wav / m4a / mp4 / ogg / flac / webm / aac）",
@@ -557,8 +822,7 @@ async def transcribe(
         num_speakers=num_speakers,
         add_punctuation=not no_punctuation,
     )
-    save_job(record)
-    background_tasks.add_task(_run_transcription, job_id, upload_path, record)
+    enqueue_job(record, upload_path)
 
     return JSONResponse(
         status_code=202,
@@ -673,7 +937,7 @@ def delete_job(job_id: str):
     out_dir = OUTPUT_DIR / job_id
     if out_dir.exists():
         shutil.rmtree(out_dir, ignore_errors=True)
-    _job_file(job_id).unlink(missing_ok=True)
+    delete_job_record(job_id)
 
     return DeleteResponse(message=f"工作 {job_id} 已刪除。")
 
