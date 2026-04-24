@@ -19,6 +19,7 @@ transcribe_api.py - WhisperX 語音轉錄 + 語者分離 API 服務
 
 import json
 import os
+import re
 import shutil
 import sys
 import threading
@@ -61,6 +62,8 @@ JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
 _jobs_lock = threading.Lock()
 _nouns_lock = threading.Lock()
+NOUN_TERM_PATTERN = re.compile(r"^[\w .-]+$")
+MAX_PROPER_NOUNS = int(os.environ.get("MAX_PROPER_NOUNS", "48"))
 
 
 class JobStatus(str, Enum):
@@ -929,6 +932,27 @@ def _save_nouns(terms: List[str]):
         PROPER_NOUNS_CSV.write_text(", ".join(terms), encoding="utf-8")
 
 
+def _validate_noun_term(term: str, field_name: str) -> str:
+    term = term.strip()
+    if not term:
+        raise HTTPException(status_code=422, detail=f"{field_name} cannot be empty")
+    if not NOUN_TERM_PATTERN.fullmatch(term):
+        raise HTTPException(
+            status_code=422,
+            detail=f"{field_name} can only contain letters, numbers, spaces, '_', '-', and '.'",
+        )
+    return term
+
+
+def _ensure_noun_count_within_limit(terms: List[str], *, adding: bool = False):
+    next_total = len(terms) + (1 if adding else 0)
+    if next_total > MAX_PROPER_NOUNS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"proper nouns cannot exceed {MAX_PROPER_NOUNS} terms",
+        )
+
+
 # ---------------------------------------------------------------------------
 # 專有名詞 Routes
 # ---------------------------------------------------------------------------
@@ -965,18 +989,34 @@ def list_proper_nouns():
     dependencies=[Depends(verify_api_key)],
 )
 def add_proper_noun(body: NounAddRequest):
-    term = body.term.strip()
-    if not term:
-        raise HTTPException(status_code=422, detail="term 不可為空字串。")
+    term = _validate_noun_term(body.term, "term")
     terms = _load_nouns()
     if term in terms:
         raise HTTPException(status_code=409, detail=f"專有名詞「{term}」已存在。")
+    _ensure_noun_count_within_limit(terms, adding=True)
     terms.append(term)
     _save_nouns(terms)
     return JSONResponse(
         status_code=201,
         content=NounListResponse(total=len(terms), terms=terms).model_dump(),
     )
+
+
+@app.delete(
+    "/proper-nouns",
+    tags=["專有名詞"],
+    summary="Delete all proper nouns",
+    description="Clear all proper nouns used for ASR prompt injection.",
+    response_model=NounListResponse,
+    responses={
+        200: {"description": "Deleted successfully; returns an empty list.", "model": NounListResponse},
+        401: {"description": "Invalid API key", "model": ErrorResponse},
+    },
+    dependencies=[Depends(verify_api_key)],
+)
+def delete_all_proper_nouns():
+    _save_nouns([])
+    return NounListResponse(total=0, terms=[])
 
 
 @app.put(
@@ -994,12 +1034,11 @@ def add_proper_noun(body: NounAddRequest):
     dependencies=[Depends(verify_api_key)],
 )
 def update_proper_noun(term: str, body: NounUpdateRequest):
-    new_term = body.new_term.strip()
-    if not new_term:
-        raise HTTPException(status_code=422, detail="new_term 不可為空字串。")
+    new_term = _validate_noun_term(body.new_term, "new_term")
     terms = _load_nouns()
     if term not in terms:
         raise HTTPException(status_code=404, detail=f"找不到專有名詞「{term}」。")
+    _ensure_noun_count_within_limit(terms)
     if new_term != term and new_term in terms:
         raise HTTPException(status_code=409, detail=f"專有名詞「{new_term}」已存在。")
     idx = terms.index(term)

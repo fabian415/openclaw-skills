@@ -602,7 +602,7 @@ paths:
       description: |
         將一個新詞加入 ASR 熱詞清單末尾。
 
-        **注意**：若該詞已存在於清單中，回傳 409。
+        **注意**：若該詞已存在於清單中，回傳 409；清單最多 30 筆。
       operationId: addProperNoun
       requestBody:
         required: true
@@ -633,13 +633,33 @@ paths:
               example:
                 detail: "專有名詞「WhisperX」已存在。"
         "422":
-          description: term 為空字串
+          description: term 格式錯誤，或專有名詞總數超過 30 筆
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
               example:
-                detail: "term 不可為空字串。"
+                detail: "proper nouns cannot exceed 30 terms"
+
+    delete:
+      tags: [專有名詞]
+      summary: 刪除全部專有名詞
+      description: |
+        清空 ASR 提示詞注入使用的完整專有名詞清單。
+        成功後回傳空清單。
+      operationId: deleteAllProperNouns
+      responses:
+        "200":
+          description: 刪除成功，回傳空清單
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NounListResponse"
+              example:
+                total: 0
+                terms: []
+        "401":
+          $ref: "#/components/responses/Unauthorized"
 
   # -------------------------------------------------------------------------
   # PUT /proper-nouns/{term}  DELETE /proper-nouns/{term}
@@ -698,6 +718,14 @@ paths:
                 $ref: "#/components/schemas/ErrorResponse"
               example:
                 detail: "專有名詞「NPU」已存在。"
+        "422":
+          description: new_term 格式錯誤，或專有名詞總數超過 30 筆
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                detail: "proper nouns cannot exceed 30 terms"
 
     delete:
       tags: [專有名詞]
@@ -1091,7 +1119,8 @@ components:
       properties:
         term:
           type: string
-          description: 要新增的專有名詞
+          pattern: "^[\\w .-]+$"
+          description: 要新增的專有名詞，只允許文字、數字、空白、底線、連字號與句點
           example: WhisperX
 
     NounUpdateRequest:
@@ -1102,7 +1131,8 @@ components:
       properties:
         new_term:
           type: string
-          description: 修改後的專有名詞
+          pattern: "^[\\w .-]+$"
+          description: 修改後的專有名詞，只允許文字、數字、空白、底線、連字號與句點
           example: NPU
 
     ErrorResponse:
