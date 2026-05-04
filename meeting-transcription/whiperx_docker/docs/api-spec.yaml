@@ -53,8 +53,6 @@ tags:
     description: 查詢、列出、刪除工作
   - name: 聲紋庫
     description: Speaker 聲紋註冊與管理（Enrollment-based Speaker Identification）
-  - name: 專有名詞
-    description: 管理 ASR 熱詞清單（提升辨識準確率）
   - name: 系統
     description: 健康檢查與服務狀態
 
@@ -67,6 +65,28 @@ paths:
   # -------------------------------------------------------------------------
   # POST /transcribe
   # -------------------------------------------------------------------------
+  # -------------------------------------------------------------------------
+  # GET /transcribe/terms-limit
+  # -------------------------------------------------------------------------
+  /transcribe/terms-limit:
+    get:
+      tags: [轉錄]
+      summary: 查詢 terms 數量上限
+      description: 回傳每次 POST /transcribe 可傳入的 terms 專有名詞數量上限。超過上限會回傳 422，避免 hotwords/prompt 過長造成記憶體壓力或 OOM。
+      operationId: getTermsLimit
+      responses:
+        "200":
+          description: terms 上限與風險說明
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TermsLimitResponse"
+              example:
+                max_terms: 30
+                warning: "Too many terms can make ASR hotwords/prompt too large, increase memory usage, and may cause OOM. Keep only the proper nouns needed for this transcription job."
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
   /transcribe:
     post:
       tags: [轉錄]
@@ -129,6 +149,11 @@ paths:
                   description: |
                     設為 `true` 可跳過 Groq 標點補強（加快速度，但輸出無標點）。
                     若服務端未設定 `GROQ_API_KEY`，此參數無效（自動跳過補強）。
+                terms:
+                  type: string
+                  nullable: true
+                  description: 本次轉錄任務使用的專有名詞，多個詞以逗點分隔，可不帶。例如：WhisperX, NVIDIA, Openclaw
+                  example: WhisperX, NVIDIA, Openclaw
             encoding:
               audio:
                 contentType: audio/mpeg, audio/wav, audio/mp4, audio/ogg, audio/flac, audio/webm
@@ -149,6 +174,14 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "413":
           $ref: "#/components/responses/FileTooLarge"
+        "422":
+          description: terms 數量超過上限或格式錯誤，可能造成 hotwords/prompt 過長與 OOM 風險
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                detail: "terms cannot exceed 30 terms. Too many terms can make ASR hotwords/prompt too large, increase memory usage, and may cause OOM. Please keep only the proper nouns needed for this transcription job."
 
   # -------------------------------------------------------------------------
   # GET /jobs/{job_id}
@@ -190,6 +223,7 @@ paths:
                     device: cuda
                     num_speakers: 3
                     add_punctuation: true
+                    terms: ["WhisperX", "NVIDIA"]
                     duration_seconds: null
                     num_speakers_detected: null
                     output_path: null
@@ -206,6 +240,7 @@ paths:
                     device: cuda
                     num_speakers: 3
                     add_punctuation: true
+                    terms: ["WhisperX", "NVIDIA"]
                     duration_seconds: 3600.0
                     num_speakers_detected: 3
                     output_path: "/app/outputs/550e8400.../meeting-2026-03-11_逐字稿.md"
@@ -222,6 +257,7 @@ paths:
                     device: cuda
                     num_speakers: null
                     add_punctuation: true
+                    terms: ["WhisperX", "NVIDIA"]
                     duration_seconds: null
                     num_speakers_detected: null
                     output_path: null
@@ -373,6 +409,7 @@ paths:
                     device: cuda
                     num_speakers: null
                     add_punctuation: true
+                    terms: ["WhisperX", "NVIDIA"]
                     duration_seconds: 3600.0
                     num_speakers_detected: 3
                     output_path: "/app/outputs/550e8400.../meeting-A_逐字稿.md"
@@ -386,6 +423,7 @@ paths:
                     device: cuda
                     num_speakers: 2
                     add_punctuation: true
+                    terms: ["WhisperX", "NVIDIA"]
                     duration_seconds: null
                     num_speakers_detected: null
                     output_path: null
@@ -575,196 +613,6 @@ paths:
                 detail: "找不到 Speaker：Alice"
 
   # -------------------------------------------------------------------------
-  # GET /proper-nouns
-  # -------------------------------------------------------------------------
-  /proper-nouns:
-    get:
-      tags: [專有名詞]
-      summary: 列出所有專有名詞
-      description: 回傳目前 ASR 熱詞清單中的所有專有名詞，依原始 CSV 順序排列。
-      operationId: listProperNouns
-      responses:
-        "200":
-          description: 專有名詞清單
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/NounListResponse"
-              example:
-                total: 5
-                terms: ["Rison", "NVIDIA", "GPU", "WhisperX", "Openclaw"]
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-
-    post:
-      tags: [專有名詞]
-      summary: 新增專有名詞
-      description: |
-        將一個新詞加入 ASR 熱詞清單末尾。
-
-        **注意**：若該詞已存在於清單中，回傳 409；清單最多 30 筆。
-      operationId: addProperNoun
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/NounAddRequest"
-            example:
-              term: WhisperX
-      responses:
-        "201":
-          description: 新增成功，回傳更新後的完整清單
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/NounListResponse"
-              example:
-                total: 6
-                terms: ["Rison", "NVIDIA", "GPU", "WhisperX", "Openclaw", "Pyannote"]
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "409":
-          description: 專有名詞已存在
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-              example:
-                detail: "專有名詞「WhisperX」已存在。"
-        "422":
-          description: term 格式錯誤，或專有名詞總數超過 30 筆
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-              example:
-                detail: "proper nouns cannot exceed 30 terms"
-
-    delete:
-      tags: [專有名詞]
-      summary: 刪除全部專有名詞
-      description: |
-        清空 ASR 提示詞注入使用的完整專有名詞清單。
-        成功後回傳空清單。
-      operationId: deleteAllProperNouns
-      responses:
-        "200":
-          description: 刪除成功，回傳空清單
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/NounListResponse"
-              example:
-                total: 0
-                terms: []
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-
-  # -------------------------------------------------------------------------
-  # PUT /proper-nouns/{term}  DELETE /proper-nouns/{term}
-  # -------------------------------------------------------------------------
-  /proper-nouns/{term}:
-    put:
-      tags: [專有名詞]
-      summary: 修改專有名詞
-      description: |
-        將清單中的指定詞修改為新的名稱，保留原始位置。
-
-        - 若原詞不存在 → `404`
-        - 若新詞已存在 → `409`
-      operationId: updateProperNoun
-      parameters:
-        - name: term
-          in: path
-          required: true
-          schema:
-            type: string
-          description: 要修改的現有專有名詞
-          example: GPU
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/NounUpdateRequest"
-            example:
-              new_term: NPU
-      responses:
-        "200":
-          description: 修改成功，回傳更新後的完整清單
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/NounListResponse"
-              example:
-                total: 5
-                terms: ["Rison", "NVIDIA", "NPU", "WhisperX", "Openclaw"]
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "404":
-          description: 找不到指定的專有名詞
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-              example:
-                detail: "找不到專有名詞「GPU」。"
-        "409":
-          description: 新名稱已存在於清單中
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-              example:
-                detail: "專有名詞「NPU」已存在。"
-        "422":
-          description: new_term 格式錯誤，或專有名詞總數超過 30 筆
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-              example:
-                detail: "proper nouns cannot exceed 30 terms"
-
-    delete:
-      tags: [專有名詞]
-      summary: 刪除專有名詞
-      description: |
-        從 ASR 熱詞清單中移除指定的專有名詞。
-
-        刪除後，下一次轉錄即生效（無需重啟服務）。
-      operationId: deleteProperNoun
-      parameters:
-        - name: term
-          in: path
-          required: true
-          schema:
-            type: string
-          description: 要刪除的專有名詞
-          example: GPU
-      responses:
-        "200":
-          description: 刪除成功，回傳更新後的完整清單
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/NounListResponse"
-              example:
-                total: 4
-                terms: ["Rison", "NVIDIA", "WhisperX", "Openclaw"]
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "404":
-          description: 找不到指定的專有名詞
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-              example:
-                detail: "找不到專有名詞「GPU」。"
-
-  # -------------------------------------------------------------------------
   # GET /health
   # -------------------------------------------------------------------------
   /health:
@@ -927,6 +775,12 @@ components:
           type: boolean
           description: 是否啟用標點補強
           example: true
+        terms:
+          type: array
+          description: 本次轉錄任務使用的專有名詞清單
+          items:
+            type: string
+          example: ["WhisperX", "NVIDIA", "Openclaw"]
         duration_seconds:
           type: number
           format: float
@@ -969,6 +823,21 @@ components:
           description: 說明訊息
           example: "任務已建立，請使用 GET /jobs/{job_id} 查詢進度。"
 
+    TermsLimitResponse:
+      type: object
+      description: GET /transcribe/terms-limit 的回應
+      required:
+        - max_terms
+        - warning
+      properties:
+        max_terms:
+          type: integer
+          description: 每次 POST /transcribe 可傳入的 terms 專有名詞數量上限
+          example: 30
+        warning:
+          type: string
+          description: 超過上限時的風險說明
+          example: "Too many terms can make ASR hotwords/prompt too large, increase memory usage, and may cause OOM. Keep only the proper nouns needed for this transcription job."
     JobListResponse:
       type: object
       description: GET /jobs 的回應
@@ -1092,48 +961,6 @@ components:
           type: string
           description: 說明訊息
           example: "Speaker Alice 註冊成功。"
-
-    NounListResponse:
-      type: object
-      description: 專有名詞清單回應
-      required:
-        - total
-        - terms
-      properties:
-        total:
-          type: integer
-          description: 專有名詞總數
-          example: 5
-        terms:
-          type: array
-          description: 專有名詞清單（依原始 CSV 順序）
-          items:
-            type: string
-          example: ["Rison", "NVIDIA", "GPU", "WhisperX", "Openclaw"]
-
-    NounAddRequest:
-      type: object
-      description: POST /proper-nouns 的請求體
-      required:
-        - term
-      properties:
-        term:
-          type: string
-          pattern: "^[\\w .-]+$"
-          description: 要新增的專有名詞，只允許文字、數字、空白、底線、連字號與句點
-          example: WhisperX
-
-    NounUpdateRequest:
-      type: object
-      description: PUT /proper-nouns/{term} 的請求體
-      required:
-        - new_term
-      properties:
-        new_term:
-          type: string
-          pattern: "^[\\w .-]+$"
-          description: 修改後的專有名詞，只允許文字、數字、空白、底線、連字號與句點
-          example: NPU
 
     ErrorResponse:
       type: object

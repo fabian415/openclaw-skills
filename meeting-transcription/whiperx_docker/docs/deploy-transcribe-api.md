@@ -142,6 +142,9 @@ HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 # 建議：API 驗證金鑰（不填則無認證）
 API_KEY=your-secret-api-key-here
+
+# 每次 POST /transcribe 可傳入的 terms 專有名詞數量上限
+MAX_TERMS=30
 ```
 
 **取得 HF_TOKEN：**
@@ -223,6 +226,24 @@ X-API-Key: your-secret-api-key-here
 
 ---
 
+### 查詢 terms 數量上限
+
+```bash
+curl http://<server-ip>:8787/transcribe/terms-limit \
+  -H "X-API-Key: your-secret-api-key-here"
+```
+
+**回應範例：**
+```json
+{
+  "max_terms": 30,
+  "warning": "terms 過多會讓 ASR hotwords/prompt 變長，可能增加記憶體使用量並造成 OOM；請精簡本次任務真正需要的專有名詞。"
+}
+```
+
+此上限由 `.env` 的 `MAX_TERMS` 設定。
+
+---
 ### 步驟一：上傳音訊，啟動轉錄
 
 ```bash
@@ -231,7 +252,8 @@ curl -X POST http://<server-ip>:8787/transcribe \
   -F "audio=@/path/to/meeting.mp3" \
   -F "lang=zh" \
   -F "device=cuda" \
-  -F "num_speakers=3"
+  -F "num_speakers=3" \
+  -F "terms=WhisperX, NVIDIA, Openclaw"
 ```
 
 **回應（HTTP 202）：**
@@ -250,6 +272,9 @@ curl -X POST http://<server-ip>:8787/transcribe \
 | `device` | string | `auto` | `auto` / `cpu` / `cuda` / `mps` |
 | `num_speakers` | int | null | 語者人數（不填自動偵測）|
 | `no_punctuation` | bool | `false` | `true` = 跳過標點補強 |
+| `terms` | string | 空字串 | 本次任務使用的專有名詞，多個詞以逗點分隔；可不帶 |
+
+If the number of `terms` exceeds the system limit, `POST /transcribe` returns HTTP 422. The error explains that too many terms may make ASR hotwords/prompt too large, increase memory usage, and cause OOM.
 
 ---
 
@@ -342,7 +367,11 @@ with open("meeting.mp3", "rb") as f:
         f"{BASE_URL}/transcribe",
         headers=HEADERS,
         files={"audio": f},
-        data={"lang": "zh", "device": "cuda"},
+        data={
+            "lang": "zh",
+            "device": "cuda",
+            "terms": "WhisperX, NVIDIA, Openclaw",
+        },
     )
 resp.raise_for_status()
 job_id = resp.json()["job_id"]
@@ -454,7 +483,8 @@ curl http://<server-ip>:8787/speakers
 ```bash
 curl -X POST http://<server-ip>:8787/transcribe \
   -F "audio=@meeting.mp3" \
-  -F "lang=zh"
+  -F "lang=zh" \
+  -F "terms=WhisperX, NVIDIA, Openclaw"
 ```
 
 聲紋比對在背景自動執行，逐字稿中會直接顯示姓名：

@@ -44,7 +44,6 @@ from pydantic import BaseModel, Field
 UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", "/app/uploads"))
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/app/outputs"))
 SPEAKER_DIR = Path(os.environ.get("SPEAKER_DIR", "/app/speaker_profiles"))
-PROPER_NOUNS_CSV = Path(os.environ.get("PROPER_NOUNS_CSV", "/app/Proper_Nouns.csv"))
 MAX_FILE_MB = int(os.environ.get("MAX_FILE_MB", "500"))
 JOB_TTL_HOURS = int(os.environ.get("JOB_TTL_HOURS", "48"))
 JOB_TIMEOUT_SECONDS = int(os.environ.get("JOB_TIMEOUT_SECONDS", str(6 * 60 * 60)))
@@ -68,9 +67,8 @@ _jobs_lock = threading.Lock()
 _queue_cv = threading.Condition()
 _worker_stop = threading.Event()
 _worker_thread: Optional[threading.Thread] = None
-_nouns_lock = threading.Lock()
 NOUN_TERM_PATTERN = re.compile(r"^[\w .-]+$")
-MAX_PROPER_NOUNS = int(os.environ.get("MAX_PROPER_NOUNS", "48"))
+MAX_TERMS = int(os.environ.get("MAX_TERMS", "48"))
 
 
 class JobStatus(str, Enum):
@@ -122,6 +120,11 @@ class JobRecord(BaseModel):
     add_punctuation: bool = Field(
         description="是否啟用標點補強"
     )
+    terms: List[str] = Field(
+        default_factory=list,
+        description="本次轉錄任務使用的專有名詞清單",
+        examples=[["WhisperX", "NVIDIA", "Openclaw"]],
+    )
     duration_seconds: Optional[float] = Field(
         default=None,
         description="音訊總時長（秒），完成後才有值",
@@ -155,6 +158,18 @@ class TranscribeResponse(BaseModel):
     message: str = Field(
         description="說明訊息",
         examples=["任務已建立，請使用 GET /jobs/{job_id} 查詢進度。"],
+    )
+
+class TermsLimitResponse(BaseModel):
+    """GET /transcribe/terms-limit 的回應"""
+
+    max_terms: int = Field(
+        description="每次 POST /transcribe 可傳入的 terms 專有名詞數量上限",
+        examples=[30],
+    )
+    warning: str = Field(
+        description="超過上限時的風險說明",
+        examples=["terms 過多會讓 ASR hotwords/prompt 變長，可能增加記憶體使用量並造成 OOM；請精簡本次任務真正需要的專有名詞。"],
     )
 
 
@@ -222,25 +237,6 @@ class EnrollResponse(BaseModel):
     message: str = Field(description="說明訊息", examples=["Speaker Alice 註冊成功。"])
 
 
-class NounListResponse(BaseModel):
-    """GET /proper-nouns 的回應"""
-
-    total: int = Field(description="專有名詞總數", examples=[10])
-    terms: List[str] = Field(description="專有名詞清單（依原始順序）", examples=[["Rison", "NVIDIA", "GPU"]])
-
-
-class NounAddRequest(BaseModel):
-    """POST /proper-nouns 的請求體"""
-
-    term: str = Field(description="要新增的專有名詞", examples=["WhisperX"])
-
-
-class NounUpdateRequest(BaseModel):
-    """PUT /proper-nouns/{term} 的請求體"""
-
-    new_term: str = Field(description="修改後的專有名詞", examples=["WhisperX_v3"])
-
-
 # ---------------------------------------------------------------------------
 # Job 讀寫工具
 # ---------------------------------------------------------------------------
@@ -278,6 +274,7 @@ def init_jobs_db():
                 device TEXT NOT NULL,
                 num_speakers INTEGER,
                 add_punctuation INTEGER NOT NULL,
+                terms TEXT NOT NULL DEFAULT '',
                 duration_seconds REAL,
                 num_speakers_detected INTEGER,
                 output_path TEXT,
@@ -285,7 +282,45 @@ def init_jobs_db():
             )
             """
         )
+        columns = [row["name"] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()]
+        if "terms" not in columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN terms TEXT NOT NULL DEFAULT ''")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs(status, created_at)")
+
+
+def _parse_terms_csv(value: Optional[str]) -> List[str]:
+    if not value:
+        return []
+    return [term.strip() for term in value.split(",") if term.strip()]
+
+
+def _validate_terms_csv(value: Optional[str]) -> List[str]:
+    terms = _parse_terms_csv(value)
+    if len(terms) > MAX_TERMS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"terms cannot exceed {MAX_TERMS} terms. "
+                "Too many terms can make ASR hotwords/prompt too large, increase memory usage, and may cause OOM. "
+                "Please keep only the proper nouns needed for this transcription job."
+            ),
+        )
+    seen = set()
+    normalized = []
+    for term in terms:
+        if not NOUN_TERM_PATTERN.fullmatch(term):
+            raise HTTPException(
+                status_code=422,
+                detail="terms can only contain letters, numbers, spaces, '_', '-', and '.'",
+            )
+        if term not in seen:
+            seen.add(term)
+            normalized.append(term)
+    return normalized
+
+
+def _terms_to_csv(terms: List[str]) -> str:
+    return ", ".join(terms)
 
 
 def _row_to_job(row: sqlite3.Row) -> JobRecord:
@@ -299,6 +334,7 @@ def _row_to_job(row: sqlite3.Row) -> JobRecord:
         device=row["device"],
         num_speakers=row["num_speakers"],
         add_punctuation=bool(row["add_punctuation"]),
+        terms=_parse_terms_csv(row["terms"] if "terms" in row.keys() else ""),
         duration_seconds=row["duration_seconds"],
         num_speakers_detected=row["num_speakers_detected"],
         output_path=row["output_path"],
@@ -318,6 +354,7 @@ def _record_values(record: JobRecord, audio_path: Optional[Path] = None) -> dict
         "device": record.device,
         "num_speakers": record.num_speakers,
         "add_punctuation": 1 if record.add_punctuation else 0,
+        "terms": _terms_to_csv(record.terms),
         "duration_seconds": record.duration_seconds,
         "num_speakers_detected": record.num_speakers_detected,
         "output_path": record.output_path,
@@ -331,12 +368,12 @@ def enqueue_job(record: JobRecord, audio_path: Path):
             """
             INSERT INTO jobs (
                 job_id, status, created_at, updated_at, audio_filename, audio_path,
-                language, device, num_speakers, add_punctuation, duration_seconds,
+                language, device, num_speakers, add_punctuation, terms, duration_seconds,
                 num_speakers_detected, output_path, error
             )
             VALUES (
                 :job_id, :status, :created_at, :updated_at, :audio_filename, :audio_path,
-                :language, :device, :num_speakers, :add_punctuation, :duration_seconds,
+                :language, :device, :num_speakers, :add_punctuation, :terms, :duration_seconds,
                 :num_speakers_detected, :output_path, :error
             )
             """,
@@ -361,6 +398,7 @@ def save_job(record: JobRecord):
                 device = :device,
                 num_speakers = :num_speakers,
                 add_punctuation = :add_punctuation,
+                terms = :terms,
                 duration_seconds = :duration_seconds,
                 num_speakers_detected = :num_speakers_detected,
                 output_path = :output_path,
@@ -465,12 +503,12 @@ def _migrate_json_jobs():
                     """
                     INSERT INTO jobs (
                         job_id, status, created_at, updated_at, audio_filename, audio_path,
-                        language, device, num_speakers, add_punctuation, duration_seconds,
+                        language, device, num_speakers, add_punctuation, terms, duration_seconds,
                         num_speakers_detected, output_path, error
                     )
                     VALUES (
                         :job_id, :status, :created_at, :updated_at, :audio_filename, :audio_path,
-                        :language, :device, :num_speakers, :add_punctuation, :duration_seconds,
+                        :language, :device, :num_speakers, :add_punctuation, :terms, :duration_seconds,
                         :num_speakers_detected, :output_path, :error
                     )
                     """,
@@ -572,6 +610,8 @@ def _run_transcription(job_id: str, audio_path: Path, record: JobRecord):
     ]
     if record.num_speakers:
         cmd += ["--num-speakers", str(record.num_speakers)]
+    if record.terms:
+        cmd += ["--terms", _terms_to_csv(record.terms)]
     if not record.add_punctuation:
         cmd.append("--no-punctuation")
     if SPEAKER_DIR.exists() and any(SPEAKER_DIR.glob("*.json")):
@@ -694,7 +734,6 @@ GET /jobs/{job_id}/result  → 下載 Markdown
         {"name": "轉錄", "description": "提交音訊並管理轉錄任務"},
         {"name": "工作管理", "description": "查詢、列出、刪除工作"},
         {"name": "聲紋庫", "description": "Speaker 聲紋註冊與管理"},
-        {"name": "專有名詞", "description": "管理 ASR 熱詞清單（提升辨識準確率）"},
         {"name": "系統", "description": "健康檢查與服務狀態"},
     ],
     lifespan=lifespan,
@@ -738,6 +777,28 @@ def health():
     return info
 
 
+@app.get(
+    "/transcribe/terms-limit",
+    tags=["頧?"],
+    summary="查詢每次轉錄可傳入的 terms 上限",
+    description="回傳 POST /transcribe 的 terms 專有名詞數量上限。超過上限會回傳 422，避免 hotwords/prompt 過長造成記憶體壓力或 OOM。",
+    response_model=TermsLimitResponse,
+    responses={
+        200: {"description": "terms 上限與風險說明", "model": TermsLimitResponse},
+        401: {"description": "API Key ?航炊", "model": ErrorResponse},
+    },
+    dependencies=[Depends(verify_api_key)],
+)
+def get_terms_limit():
+    return TermsLimitResponse(
+        max_terms=MAX_TERMS,
+        warning=(
+            "terms 過多會讓 ASR hotwords/prompt 變長，可能增加記憶體使用量並造成 OOM；"
+            "請精簡本次任務真正需要的專有名詞。"
+        ),
+    )
+
+
 @app.post(
     "/transcribe",
     tags=["轉錄"],
@@ -756,6 +817,7 @@ def health():
         400: {"description": "檔案格式錯誤或檔案為空", "model": ErrorResponse},
         401: {"description": "API Key 錯誤", "model": ErrorResponse},
         413: {"description": "檔案超過大小限制", "model": ErrorResponse},
+        422: {"description": "terms 數量超過上限或格式錯誤，可能造成 hotwords/prompt 過長與 OOM 風險", "model": ErrorResponse},
     },
     dependencies=[Depends(verify_api_key)],
 )
@@ -782,6 +844,10 @@ async def transcribe(
         default=False,
         description="設為 `true` 可跳過 Groq 標點補強（加快速度，但輸出無標點）",
     ),
+    terms: Optional[str] = Form(
+        default=None,
+        description="本次轉錄任務使用的專有名詞，多個詞以逗點分隔，可不填。例如：WhisperX, NVIDIA, Openclaw",
+    ),
 ):
     suffix = Path(audio.filename or "").suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
@@ -789,6 +855,8 @@ async def transcribe(
             status_code=400,
             detail=f"不支援的檔案格式：{suffix or '（無副檔名）'}。支援：{', '.join(sorted(ALLOWED_EXTENSIONS))}",
         )
+
+    parsed_terms = _validate_terms_csv(terms)
 
     job_id = str(uuid.uuid4())
     upload_path = UPLOAD_DIR / f"{job_id}{suffix}"
@@ -821,6 +889,7 @@ async def transcribe(
         device=device,
         num_speakers=num_speakers,
         add_punctuation=not no_punctuation,
+        terms=parsed_terms,
     )
     enqueue_job(record, upload_path)
 
@@ -1176,165 +1245,7 @@ def delete_speaker(name: str):
 
 
 # ---------------------------------------------------------------------------
-# 專有名詞（Proper Nouns）工具函式
-# ---------------------------------------------------------------------------
-
-def _load_nouns() -> List[str]:
-    """從 CSV 讀取專有名詞清單。"""
-    if not PROPER_NOUNS_CSV.exists():
-        return []
-    with _nouns_lock:
-        text = PROPER_NOUNS_CSV.read_text(encoding="utf-8").strip()
-    if not text:
-        return []
-    return [t.strip() for t in text.split(",") if t.strip()]
-
-
-def _save_nouns(terms: List[str]):
-    """將專有名詞清單寫回 CSV。"""
-    with _nouns_lock:
-        PROPER_NOUNS_CSV.write_text(", ".join(terms), encoding="utf-8")
-
-
-def _validate_noun_term(term: str, field_name: str) -> str:
-    term = term.strip()
-    if not term:
-        raise HTTPException(status_code=422, detail=f"{field_name} cannot be empty")
-    if not NOUN_TERM_PATTERN.fullmatch(term):
-        raise HTTPException(
-            status_code=422,
-            detail=f"{field_name} can only contain letters, numbers, spaces, '_', '-', and '.'",
-        )
-    return term
-
-
-def _ensure_noun_count_within_limit(terms: List[str], *, adding: bool = False):
-    next_total = len(terms) + (1 if adding else 0)
-    if next_total > MAX_PROPER_NOUNS:
-        raise HTTPException(
-            status_code=422,
-            detail=f"proper nouns cannot exceed {MAX_PROPER_NOUNS} terms",
-        )
-
-
-# ---------------------------------------------------------------------------
-# 專有名詞 Routes
-# ---------------------------------------------------------------------------
-
-@app.get(
-    "/proper-nouns",
-    tags=["專有名詞"],
-    summary="列出所有專有名詞",
-    description="回傳目前 ASR 熱詞清單中的所有專有名詞，依原始 CSV 順序排列。",
-    response_model=NounListResponse,
-    responses={
-        200: {"description": "專有名詞清單", "model": NounListResponse},
-        401: {"description": "API Key 錯誤", "model": ErrorResponse},
-    },
-    dependencies=[Depends(verify_api_key)],
-)
-def list_proper_nouns():
-    terms = _load_nouns()
-    return NounListResponse(total=len(terms), terms=terms)
-
-
-@app.post(
-    "/proper-nouns",
-    tags=["專有名詞"],
-    summary="新增專有名詞",
-    description="將一個新詞加入 ASR 熱詞清單末尾。若該詞已存在，回傳 409。",
-    response_model=NounListResponse,
-    status_code=201,
-    responses={
-        201: {"description": "新增成功，回傳更新後的完整清單", "model": NounListResponse},
-        401: {"description": "API Key 錯誤", "model": ErrorResponse},
-        409: {"description": "專有名詞已存在", "model": ErrorResponse},
-    },
-    dependencies=[Depends(verify_api_key)],
-)
-def add_proper_noun(body: NounAddRequest):
-    term = _validate_noun_term(body.term, "term")
-    terms = _load_nouns()
-    if term in terms:
-        raise HTTPException(status_code=409, detail=f"專有名詞「{term}」已存在。")
-    _ensure_noun_count_within_limit(terms, adding=True)
-    terms.append(term)
-    _save_nouns(terms)
-    return JSONResponse(
-        status_code=201,
-        content=NounListResponse(total=len(terms), terms=terms).model_dump(),
-    )
-
-
-@app.delete(
-    "/proper-nouns",
-    tags=["專有名詞"],
-    summary="Delete all proper nouns",
-    description="Clear all proper nouns used for ASR prompt injection.",
-    response_model=NounListResponse,
-    responses={
-        200: {"description": "Deleted successfully; returns an empty list.", "model": NounListResponse},
-        401: {"description": "Invalid API key", "model": ErrorResponse},
-    },
-    dependencies=[Depends(verify_api_key)],
-)
-def delete_all_proper_nouns():
-    _save_nouns([])
-    return NounListResponse(total=0, terms=[])
-
-
-@app.put(
-    "/proper-nouns/{term}",
-    tags=["專有名詞"],
-    summary="修改專有名詞",
-    description="將清單中的指定詞修改為新的名稱，保留原始位置。若原詞不存在回傳 404；若新詞已存在回傳 409。",
-    response_model=NounListResponse,
-    responses={
-        200: {"description": "修改成功，回傳更新後的完整清單", "model": NounListResponse},
-        401: {"description": "API Key 錯誤", "model": ErrorResponse},
-        404: {"description": "找不到指定的專有名詞", "model": ErrorResponse},
-        409: {"description": "新名稱已存在於清單中", "model": ErrorResponse},
-    },
-    dependencies=[Depends(verify_api_key)],
-)
-def update_proper_noun(term: str, body: NounUpdateRequest):
-    new_term = _validate_noun_term(body.new_term, "new_term")
-    terms = _load_nouns()
-    if term not in terms:
-        raise HTTPException(status_code=404, detail=f"找不到專有名詞「{term}」。")
-    _ensure_noun_count_within_limit(terms)
-    if new_term != term and new_term in terms:
-        raise HTTPException(status_code=409, detail=f"專有名詞「{new_term}」已存在。")
-    idx = terms.index(term)
-    terms[idx] = new_term
-    _save_nouns(terms)
-    return NounListResponse(total=len(terms), terms=terms)
-
-
-@app.delete(
-    "/proper-nouns/{term}",
-    tags=["專有名詞"],
-    summary="刪除專有名詞",
-    description="從 ASR 熱詞清單中移除指定的專有名詞。若不存在回傳 404。",
-    response_model=NounListResponse,
-    responses={
-        200: {"description": "刪除成功，回傳更新後的完整清單", "model": NounListResponse},
-        401: {"description": "API Key 錯誤", "model": ErrorResponse},
-        404: {"description": "找不到指定的專有名詞", "model": ErrorResponse},
-    },
-    dependencies=[Depends(verify_api_key)],
-)
-def delete_proper_noun(term: str):
-    terms = _load_nouns()
-    if term not in terms:
-        raise HTTPException(status_code=404, detail=f"找不到專有名詞「{term}」。")
-    terms.remove(term)
-    _save_nouns(terms)
-    return NounListResponse(total=len(terms), terms=terms)
-
-
-# ---------------------------------------------------------------------------
-# 自訂 OpenAPI schema（加入 API Key security scheme）
+# 自訂 OpenAPI schema，補上 API Key security scheme
 # ---------------------------------------------------------------------------
 
 def custom_openapi():
@@ -1352,7 +1263,7 @@ def custom_openapi():
             "type": "apiKey",
             "in": "header",
             "name": "X-API-Key",
-            "description": "服務端設定 API_KEY 環境變數後啟用。請在此輸入對應的金鑰值。",
+            "description": "使用環境變數 API_KEY 設定的 API key。",
         }
     }
     schema["security"] = [{"ApiKeyAuth": []}]
@@ -1363,7 +1274,6 @@ def custom_openapi():
 app.openapi = custom_openapi
 
 
-# ---------------------------------------------------------------------------
 # 直接執行
 # ---------------------------------------------------------------------------
 

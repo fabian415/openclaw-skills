@@ -40,51 +40,20 @@ Output:
 """
 
 import argparse
-import csv
 import gc
 import os
 import sys
 from pathlib import Path
 
 
-def load_proper_nouns(csv_path: str = None) -> list:
-    """
-    從 CSV 檔案載入專有名詞清單。
-
-    CSV 格式：單行逗號分隔，例如：
-        NVIDIA,DeviceOn,WEDA,GenAI Studio,Oniverse
-
-    csv_path 優先順序：
-      1. 傳入的 csv_path 參數
-      2. 環境變數 PROPER_NOUNS_CSV
-      3. 腳本同目錄下的 Proper_Nouns.csv
-    """
-    candidates = []
-    if csv_path:
-        candidates.append(Path(csv_path))
-
-    env_path = os.environ.get("PROPER_NOUNS_CSV")
-    if env_path:
-        candidates.append(Path(env_path))
-
-    # 腳本同目錄 or 工作目錄
-    script_dir = Path(__file__).parent
-    candidates.append(script_dir / "Proper_Nouns.csv")
-    candidates.append(Path.cwd() / "Proper_Nouns.csv")
-
-    for path in candidates:
-        if path.exists():
-            with open(path, newline="", encoding="utf-8") as f:
-                reader = csv.reader(f)
-                nouns = []
-                for row in reader:
-                    nouns.extend(term.strip() for term in row if term.strip())
-            print(f"載入專有名詞：{len(nouns)} 個（來源：{path}）")
-            return nouns
-
-    print("提示：未找到 Proper_Nouns.csv，跳過專有名詞注入。", file=sys.stderr)
-    return []
-
+def parse_terms(terms: str = None) -> list:
+    """Parse comma-separated proper nouns for a single transcription job."""
+    if not terms:
+        return []
+    parsed = [term.strip() for term in terms.split(",") if term.strip()]
+    if parsed:
+        print(f"載入本次任務專有名詞：{len(parsed)} 個")
+    return parsed
 
 def get_device(preferred: str = "auto") -> str:
     """Detect best available device."""
@@ -272,6 +241,7 @@ def transcribe_with_diarization(
     device: str = "auto",
     num_speakers: int = None,
     speaker_dir: Path = None,
+    terms: list = None,
 ) -> tuple:
     """
     使用 WhisperX 進行轉錄 + 語者分離。
@@ -328,8 +298,8 @@ def transcribe_with_diarization(
     model_name = "large-v3" if resolved_device != "cpu" else "medium"
     print(f"載入 Whisper 模型（{model_name}）...")
 
-    proper_nouns = load_proper_nouns()
-    noun_str = ", ".join(proper_nouns)
+    term_list = terms or []
+    noun_str = ", ".join(term_list)
 
     # initial_prompt 只保留語境句，避免 Whisper 將過長的 prompt 複誦進轉錄結果
     asr_options = {"beam_size": 10, "initial_prompt": "以下是一段中文會議錄音的逐字稿。"}
@@ -410,6 +380,8 @@ def main():
                         help="指定語者人數（選填；不指定則自動偵測）")
     parser.add_argument("--no-punctuation", action="store_true",
                         help="跳過標點補強步驟（預設：自動補標點)")
+    parser.add_argument("--terms", default=None,
+                        help="本次任務使用的專有名詞，多個詞以逗點分隔")
     parser.add_argument("--speaker-dir", default=None,
                         help="聲紋庫目錄路徑（選填；設定後啟用聲紋比對功能）")
     args = parser.parse_args()
@@ -433,6 +405,7 @@ def main():
         device=args.device,
         num_speakers=args.num_speakers,
         speaker_dir=speaker_dir,
+        terms=parse_terms(args.terms),
     )
 
     add_punct = not args.no_punctuation

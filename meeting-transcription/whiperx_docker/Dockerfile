@@ -32,9 +32,6 @@ COPY scripts/transcribe_diarize.py /app/
 COPY scripts/transcribe_api.py /app/
 COPY scripts/speaker_db.py /app/
 
-# ---- 複製專有名詞清單（選填，可於執行時掛載覆蓋） ----
-COPY Proper_Nouns.csv /app/Proper_Nouns.csv
-
 # ---- 資料目錄 ----
 RUN mkdir -p /app/uploads /app/outputs /app/speaker_profiles
 
@@ -46,8 +43,8 @@ ENV UPLOAD_DIR=/app/uploads \
     MAX_FILE_MB=500 \
     JOB_TTL_HOURS=48 \
     JOB_TIMEOUT_SECONDS=10800 \
-    PORT=8000 \
-    PROPER_NOUNS_CSV=/app/Proper_Nouns.csv
+    MAX_TERMS=30 \
+    PORT=8000
 
 EXPOSE 8000
 
